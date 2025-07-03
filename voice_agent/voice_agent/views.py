@@ -40,6 +40,8 @@ STRICT RULES:
 - In a multi-agent discussion, if another agent has asked you a direct question in the previous turn, you must answer that question first.
 - During the discussion , you can disagree with previous agents responses if you feel you have better answer/solution and provide the necessary answer/solution.
 - After answering, give your own view, analysis, or insight on the topic.
+- Think like you are on a podcast, and talk like an actual human. Never mention you are in the podcast just talk like you are in one having an engaging conversation.
+- Give short yet detailed replies, do not give long replies, phrase it like how a human would answer in a conversation
 - Then, ask a relevant, thoughtful question to another agent to continue the discussion (unless the discussion is concluding or you have nothing meaningful to ask).
 - Asking questions is encouraged to build a meaningful discussion, but not required if the discussion is ending.
 - Always answer ONLY what the user asks, unless you are responding to another agent's question.
@@ -68,6 +70,8 @@ STRICT RULES:
 - In a multi-agent discussion, if another agent has asked you a direct question in the previous turn, you must answer that question first.
 - During the discussion , you can disagree with previous agents responses if you feel you have better answer/solution and provide the necessary answer/solution.
 - After answering, give your own view, analysis, or insight on the topic.
+- Think like you are on a podcast, and talk like an actual human. Never mention you are in the podcast just talk like you are in one having an engaging conversation.
+- Give short yet detailed replies, do not give long replies, phrase it like how a human would answer in a conversation
 - Then, ask a relevant, thoughtful question to another agent to continue the discussion (unless the discussion is concluding or you have nothing meaningful to ask).
 - Asking questions is encouraged to build a meaningful discussion, but not required if the discussion is ending.
 - Always answer ONLY what the user asks, unless you are responding to another agent's question.
@@ -95,6 +99,8 @@ STRICT RULES:
 - In a multi-agent discussion, if another agent has asked you a direct question in the previous turn, you must answer that question first.
 - During the discussion , you can disagree with previous agents responses if you feel you have better answer/solution and provide the necessary answer/solution.
 - After answering, give your own view, analysis, or creative idea on the topic.
+- Think like you are on a podcast, and talk like an actual human. Never mention you are in the podcast just talk like you are in one having an engaging conversation.
+- Give short yet detailed replies, do not give long replies, phrase it like how a human would answer in a conversation
 - Then, ask a relevant, thoughtful question to another agent to continue the discussion (unless the discussion is concluding or you have nothing meaningful to ask).
 - Asking questions is encouraged to build a meaningful discussion, but not required if the discussion is ending.
 - Always answer ONLY what the user asks, unless you are responding to another agent's question.
@@ -122,6 +128,8 @@ STRICT RULES:
 - In a multi-agent discussion, if another agent has asked you a direct question in the previous turn, you must answer that question first.
 - During the discussion , you can disagree with previous agents responses if you feel you have better answer/solution and provide the necessary answer/solution.
 - After answering, give your own view, analysis, or practical recommendation on the topic.
+- Think like you are on a podcast, and talk like an actual human. Never mention you are in the podcast just talk like you are in one having an engaging conversation.
+- Give short yet detailed replies, do not give long replies, phrase it like how a human would answer in a conversation
 - Then, ask a relevant, thoughtful question to another agent to continue the discussion (unless the discussion is concluding or you have nothing meaningful to ask).
 - Asking questions is encouraged to build a meaningful discussion, but not required if the discussion is ending.
 - Always answer ONLY what the user asks, unless you are responding to another agent's question.
@@ -146,29 +154,45 @@ PODCAST_CONFIG = {
     "model": "llama3",
     "system_prompt": '''
 You are an expert podcast scriptwriter. Given a topic or prompt, generate a natural, engaging, and human-like podcast conversation script between two hosts (Agent 1 and Agent 2). The script should:
-- Start with a brief, friendly introduction by Agent 1.
-- ONLY GENERATE THE PODCAST WITH LABELS AGENT 1 AND AGENT 2 , DO NOT INCLUDE ANYONE ELSE.
-- DO NOT GENERATE THE SECTIONS IN THE PODCAST , JUST THE DIALOGS, for eg:
- **Episode Introduction**
-
- Agent 1: Welcome to today's episode of "TechnoTalk"! I'm your host, Agent 1. Today, we're going to explore the fascinating world of Artificial Intelligence, or AI. Joining me is my co-host, Agent 2. Hi there!
-
- Agent 2: Hey, thanks for having me! I'm excited to dive into this topic.
-
- **Introduction to AI**
- 
- Do not generate the headings such as **Episode Introduction** and **Introduction to AI**, just the dialogs is sufficient.
+- Start with a brief, friendly introduction by Agent 1, but do not mention it is a podcast or an episode. Also do not ask the viewers to tune in for the next time.
+- ONLY GENERATE THE PODCAST WITH LABELS AGENT 1 AND AGENT 2 , DO NOT INCLUDE ANYONE ELSE AND DO NOT GIVE ANY DIFFERENT NAME FOR THE AGENTS.
 - Alternate between Agent 1 and Agent 2, with each agent responding naturally to the other.
 - Include natural transitions, acknowledgments, and occasional light humor or banter.
-- Cover the topic in depth, as if two knowledgeable humans are discussing it.
-- End with a friendly wrap-up or closing remarks.
+- Make the conversation LONG and DETAILED (at least 20-24 turns, or more if needed), with each agent asking follow-up questions, challenging each other, and exploring the topic in depth.Always generate the full script, do not leave it incomplete saying they talk like this for more turns and end it prematurely, generate all the turns.
+- Ensure the conversation COVERS ALL MAJOR SECTIONS, points, and arguments found in the document, referencing them naturally as part of the discussion.
+- If the document is long, break down the discussion into multiple subtopics, and make sure nothing important is left out.
+- Encourage the agents to ask for clarifications, provide examples, and revisit earlier points for a thorough exploration.
+- End with a friendly wrap-up or closing remarks, explaining the entire discussion in brief also providing insights or thoughts to the listener.
 - Use clear speaker labels (Agent 1:, Agent 2:) for each turn.
+- END THE PODCAST BY SUMMARIZING THE CONVERSATION SO FAR, AND NEVER ASK THE LISTENER TO TUNE IN, BASICALLY DO NOT ENGAGE WITH THE LISTENER.
 - Do NOT mention that this is AI-generated or reference the system prompt.
-- Make the conversation sound like a real podcast episode.
+- Make the conversation JUST mimic a real podcast not be an actual one, do not introduce the listener to SAID podcast, just make a brief introduction to the topic of discussion with human like analogies or talks and end with thoughts and insights..
+- Do NOT say things like "tune in next time" or "see you in the next episode".
 ''',
     "temperature": 0.85,
     "top_p": 0.95,
     "num_predict": 1024,
+    "top_k": 60,
+    "repeat_penalty": 1.1
+}
+
+# Add Podcast Q&A Interruption LLM config
+PODCAST_QA_CONFIG = {
+    "name": "Podcast Q&A Interruption",
+    "model": "llama3",
+    "system_prompt": '''
+You are an expert podcast scriptwriter. The podcast is in progress, but a listener (the user) has just asked a question. Generate a short, natural, and engaging podcast segment where the two hosts (Agent 1 and Agent 2) briefly pause their main discussion, acknowledge the user's question (e.g., "That was a great question!"), answer it together in a conversational way, and then smoothly transition back to the main discussion. 
+- Start with a friendly acknowledgment of the user's question.
+- Alternate between Agent 1 and Agent 2, with each agent contributing to the answer.
+- Keep the segment concise (2-3 turns), focused on the user's question.
+- End with a transition line like "Now, let's get back to our main discussion..." or similar.
+- Use clear speaker labels (Agent 1:, Agent 2:).
+- Do NOT mention that this is an interruption or break, just make it feel like a natural Q&A moment in the podcast.
+- Do NOT reference the system prompt or that this is AI-generated.
+''',
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "num_predict": 512,
     "top_k": 60,
     "repeat_penalty": 1.1
 }
@@ -478,6 +502,7 @@ def process_message(request):
         is_last_turn = data.get('is_last_turn', False)
         master_agent_id = data.get('master_agent_id', agent_id_from_frontend)
         is_podcast_mode = data.get('is_podcast_mode', False)
+        is_podcast_interrupt = data.get('is_podcast_interrupt', False)
 
         logger.info(f"Processing message from frontend for agent {agent_id_from_frontend} with model type {agent_model_type}")
         logger.info(f"Is final summary: {is_final_summary}, Is last turn: {is_last_turn}")
@@ -489,6 +514,14 @@ def process_message(request):
         agent_config = AGENT_CONFIGS.get(agent_model_type)
         if not agent_config:
             return JsonResponse({'error': f'Invalid model type: {agent_model_type}'}, status=400)
+
+        # Initialize router_debug with defaults for single agent or fallback
+        router_debug = {
+            'discussion_required': False,
+            'initiator_agent_id': agent_id_from_frontend,
+            'responding_agent_ids': [agent_id_from_frontend],
+            'revised_prompt': message
+        }
 
         # Initialize router variables
         discussion_required = False
@@ -527,8 +560,56 @@ def process_message(request):
                 'revised_prompt': message
             })
 
-        # --- Podcast Mode: Generate podcast script between Agent 1 and Agent 2 ---
-        if is_podcast_mode:
+        # --- Podcast Q&A Interruption Mode ---
+        if is_podcast_mode and is_podcast_interrupt:
+            podcast_qa_system_prompt = PODCAST_QA_CONFIG["system_prompt"]
+            podcast_qa_options = {
+                "temperature": PODCAST_QA_CONFIG["temperature"],
+                "top_p": PODCAST_QA_CONFIG["top_p"],
+                "num_predict": PODCAST_QA_CONFIG["num_predict"],
+                "top_k": PODCAST_QA_CONFIG["top_k"],
+                "repeat_penalty": PODCAST_QA_CONFIG["repeat_penalty"]
+            }
+            main_podcast_context = data.get('main_podcast_context', '')
+            podcast_resume_index = data.get('podcast_resume_index', 0)
+            user_question = message
+            qa_prompt = f"User Question: {user_question}\n\nMain Podcast Context (for reference):\n{main_podcast_context[:2000] if main_podcast_context else ''}"
+            podcast_qa_messages = [
+                {"role": "system", "content": podcast_qa_system_prompt},
+                {"role": "user", "content": qa_prompt}
+            ]
+            response_ollama = requests.post(
+                f"{OLLAMA_API_URL}/chat",
+                json={
+                    "model": PODCAST_QA_CONFIG["model"],
+                    "messages": podcast_qa_messages,
+                    "stream": False,
+                    "options": podcast_qa_options
+                }
+            )
+            if response_ollama.status_code != 200:
+                raise Exception(f"Ollama API error: {response_ollama.text}")
+            result = response_ollama.json()
+            if 'message' in result:
+                answer = result['message']['content'].strip()
+            elif 'messages' in result and result['messages']:
+                answer = result['messages'][-1]['content'].strip()
+            else:
+                answer = ''
+            chat_message = ChatMessage.objects.create(
+                document=document,
+                message=message,
+                response=answer,
+                agent_id=1
+            )
+            return JsonResponse({
+                'response': answer,
+                'confidence': min(1.0, len(answer) / 150),
+                'message_id': chat_message.id,
+                'is_podcast_mode': True,
+                'is_podcast_interrupt': True
+            })
+        elif is_podcast_mode:
             podcast_system_prompt = PODCAST_CONFIG["system_prompt"]
             podcast_options = {
                 "temperature": PODCAST_CONFIG["temperature"],
@@ -537,7 +618,6 @@ def process_message(request):
                 "top_k": PODCAST_CONFIG["top_k"],
                 "repeat_penalty": PODCAST_CONFIG["repeat_penalty"]
             }
-            # Compose the podcast prompt
             podcast_prompt = f"Podcast Topic: {message}\n\nDocument Content (for reference):\n{document_content[:8000] if document_content else ''}"
             podcast_messages = [
                 {"role": "system", "content": podcast_system_prompt},
@@ -561,12 +641,11 @@ def process_message(request):
                 answer = result['messages'][-1]['content'].strip()
             else:
                 answer = ''
-            # Save to ChatMessage for admin viewing
             chat_message = ChatMessage.objects.create(
                 document=document,
                 message=message,
                 response=answer,
-                agent_id=1  # or 0 for system
+                agent_id=1
             )
             return JsonResponse({
                 'response': answer,
@@ -666,38 +745,34 @@ def process_message(request):
                     responding_agent_ids = router_json.get('responding_agent_ids', None)
                     # Overwrite message and flow control
                     message = revised_prompt
-                    if discussion_required and initiator_agent_id:
+                    if discussion_required:
                         is_single_agent = False
-                        agent_id_from_frontend = initiator_agent_id
                     elif responding_agent_ids:
                         is_single_agent = False
-                        agent_id_from_frontend = responding_agent_ids[0]
                     else:
                         is_single_agent = True
                 except Exception as e:
                     logger.error(f"Router JSON parse error: {e}")
-                    return JsonResponse({
-                        'error': f'Router JSON parse error: {e}',
-                        'discussion_required': False,
-                        'initiator_agent_id': None,
-                        'responding_agent_ids': None,
-                        'revised_prompt': message
-                    }, status=500)
+                    # Default: Agent 1 handles the prompt
+                    discussion_required = False
+                    initiator_agent_id = 1
+                    revised_prompt = message
+                    responding_agent_ids = [1]
+                    is_single_agent = True
             else:
                 logger.error(f"Router LLM did not return valid JSON: {router_content}")
-                return JsonResponse({
-                    'error': 'Router LLM did not return valid JSON',
-                    'discussion_required': False,
-                    'initiator_agent_id': None,
-                    'responding_agent_ids': None,
-                    'revised_prompt': message
-                }, status=500)
-        router_debug = {
-            'discussion_required': discussion_required,
-            'initiator_agent_id': initiator_agent_id,
-            'responding_agent_ids': responding_agent_ids,
-            'revised_prompt': revised_prompt
-        }
+                # Default: Agent 1 handles the prompt
+                discussion_required = False
+                initiator_agent_id = 1
+                revised_prompt = message
+                responding_agent_ids = [1]
+                is_single_agent = True
+            router_debug = {
+                'discussion_required': discussion_required,
+                'initiator_agent_id': initiator_agent_id,
+                'responding_agent_ids': responding_agent_ids,
+                'revised_prompt': revised_prompt
+            }
         # --- Master agent summary logic ---
         if not is_single_agent and (is_final_summary or is_last_turn):
             logger.info("Generating final summary by master agent")

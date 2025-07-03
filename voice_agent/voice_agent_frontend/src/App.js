@@ -29,6 +29,7 @@ import SettingsIcon from '@mui/icons-material/Settings';
 import EditIcon from '@mui/icons-material/Edit';
 import CloseIcon from '@mui/icons-material/Close';
 import ReplayIcon from '@mui/icons-material/Replay';
+import DownloadIcon from '@mui/icons-material/Download';
 import './App.css';
 
 // Mutex class for narration lock
@@ -97,6 +98,24 @@ function App() {
   const [podcastTurns, setPodcastTurns] = useState([]);
   const [podcastNarrationActive, setPodcastNarrationActive] = useState(false);
   const [podcastCurrentTurn, setPodcastCurrentTurn] = useState(0);
+  // Add state for podcast loading
+  const [isPodcastLoading, setIsPodcastLoading] = useState(false);
+  // --- Transcript State ---
+  const [conversationTranscript, setConversationTranscript] = useState([]); // Array of strings, each is a line (User: ... or Agent X: ...)
+  const [contextResetFlag, setContextResetFlag] = useState(0); // Incremented on context reset
+  // --- Podcast Q&A Interruption State ---
+  const [isPodcastInterrupted, setIsPodcastInterrupted] = useState(false);
+  const [podcastResumeIndex, setPodcastResumeIndex] = useState(0);
+  const [podcastMainScript, setPodcastMainScript] = useState(null); // store main script for context
+  // --- Add narration queue state ---
+  const [narrationQueue, setNarrationQueue] = useState([]);
+  const [isNarratingQueue, setIsNarratingQueue] = useState(false);
+  const [isPodcastQALoading, setIsPodcastQALoading] = useState(false); // Q&A loading state
+  // Add state for podcast narration dialog number
+  const [mainDialogNumber, setMainDialogNumber] = useState(0);
+  // Add state for mini script (Q&A) narration
+  const [miniScriptTurns, setMiniScriptTurns] = useState([]);
+  const [miniScriptNarrationActive, setMiniScriptNarrationActive] = useState(false);
 
   const fileInputRef = useRef(null);
   const audioRef = useRef(null);
@@ -104,7 +123,7 @@ function App() {
   const messagesEndRefs = useRef({});
 
   const { 
-    transcript,
+    transcript: speechRecognitionTranscript,
     listening: speechRecognitionListening,
     resetTranscript,
     browserSupportsSpeechRecognition
@@ -180,6 +199,17 @@ function App() {
     return formattedLines.join('');
   };
 
+  // Helper function to clean text for transcript (remove HTML, normalize spacing)
+  const cleanTextForTranscript = (text) => {
+    // Remove any HTML tags
+    let cleaned = text.replace(/<[^>]*>/g, '');
+    // Normalize line breaks and spacing
+    cleaned = cleaned.replace(/\n\s*\n/g, '\n\n'); // Remove excessive blank lines
+    cleaned = cleaned.replace(/\s+$/gm, ''); // Remove trailing spaces from lines
+    cleaned = cleaned.trim(); // Remove leading/trailing whitespace
+    return cleaned;
+  };
+
   useEffect(() => {
     agents.forEach(agent => {
       if (messagesEndRefs.current[agent.id]) {
@@ -188,77 +218,64 @@ function App() {
     });
   }, [agents]);
 
-  // Modify the discussion effect to properly handle the final summary
+  // Modify the discussion effect to pipeline LLM and narration
   useEffect(() => {
     if (isDiscussionActive && !isLoading && discussionAgents.length > 0 && agents.length > 1) {
-      const timer = setTimeout(async () => {
-        const maxTurns = discussionLimit - 2; // 2n-1 normal responses, then 1 final summary (total discussionLimit responses)
-        const isSummaryTurn = discussionTurn === maxTurns;
-
-        if (isSummaryTurn) {
-          // Wait for narration to finish, then pause, then play summary
-          if (isNarrating) {
-            await new Promise(resolve => {
-              const checkNarration = setInterval(() => {
-                if (!isNarrating) {
-                  clearInterval(checkNarration);
-                  resolve();
-                }
-              }, 100);
-            });
-          }
-          // Add a pause before summary
-          await new Promise(resolve => setTimeout(resolve, 1500));
-          const summaryAgentId = discussionAgents[0]; // Initiator agent is now the summary agent
-          const summaryAgent = agents.find(a => a.id === summaryAgentId);
-
-          if (summaryAgent) {
-            setIsDiscussionActive(false);
-            const summaryResponse = await processAgentTurn(
-              summaryAgentId,
-              discussionHistory.join('\n'),
-              false,
-              null,
-              true, // isLastTurn
-              true  // isFinalSummary
-            );
-
+      const maxTurns = discussionLimit - 2; // 2n-1 normal responses, then 1 final summary (total discussionLimit responses)
+      const isSummaryTurn = discussionTurn === maxTurns;
+      if (isSummaryTurn) {
+        // --- Pipeline: trigger summary LLM call immediately, push to narration queue when ready ---
+        const summaryAgentId = discussionAgents[0];
+        const summaryAgent = agents.find(a => a.id === summaryAgentId);
+        if (summaryAgent) {
+          setIsDiscussionActive(false);
+          processAgentTurn(
+            summaryAgentId,
+            discussionHistory.join('\n'),
+            false,
+            null,
+            true, // isLastTurn
+            true  // isFinalSummary
+          ).then((summaryResponse) => {
             if (summaryResponse) {
               setLastUserPrompt('Final Summary of Discussion');
             }
-          }
-          setDiscussionAgents([]);
-          setDiscussionHistory([]);
-        } else if (discussionTurn < maxTurns) {
-          // Regular agent turn
-          const nextTurn = discussionTurn + 1;
-          const nextAgentIndex = nextTurn % discussionAgents.length;
-          const nextAgentId = discussionAgents[nextAgentIndex];
-
-          // Wait for any ongoing narration to complete
-          if (isNarrating) {
-            await new Promise(resolve => {
-              const checkNarration = setInterval(() => {
-                if (!isNarrating) {
-                  clearInterval(checkNarration);
-                  resolve();
-                }
-              }, 100);
-            });
-          }
-
-          const latestDiscussion = discussionHistory.join('\n');
-          const responseContent = await processAgentTurn(nextAgentId, latestDiscussion, false, null, false);
-
+          });
+        }
+        setDiscussionAgents([]);
+        setDiscussionHistory([]);
+      } else if (discussionTurn < maxTurns) {
+        // Pipeline: trigger next agent LLM call immediately after previous response
+        const nextTurn = discussionTurn + 1;
+        const nextAgentIndex = nextTurn % discussionAgents.length;
+        const nextAgentId = discussionAgents[nextAgentIndex];
+        const latestDiscussion = discussionHistory.join('\n');
+        // Only trigger if not already in progress
+        processAgentTurn(nextAgentId, latestDiscussion, false, null, false).then((responseContent) => {
           if (responseContent) {
             setDiscussionTurn(nextTurn);
           }
-        }
-      }, 2000);
-
-      return () => clearTimeout(timer);
+        });
+      }
     }
-  }, [isDiscussionActive, isLoading, discussionTurn, discussionAgents, discussionHistory, currentDocument, isNarrating, agents.length, discussionLimit]);
+  }, [isDiscussionActive, isLoading, discussionTurn, discussionAgents, discussionHistory, currentDocument, isNarratingQueue, narrationQueue.length, agents.length, discussionLimit]);
+
+  // --- Narration queue handler ---
+  useEffect(() => {
+    if (!isNarratingQueue && narrationQueue.length > 0) {
+      const { agentId, text, token } = narrationQueue[0];
+      // Only play if token matches
+      if (token !== currentRequestToken.current) {
+        setNarrationQueue(q => q.slice(1));
+        return;
+      }
+      setIsNarratingQueue(true);
+      playVoiceResponse(text, agentId).finally(() => {
+        setNarrationQueue(q => q.slice(1));
+        setIsNarratingQueue(false);
+      });
+    }
+  }, [narrationQueue, isNarratingQueue]);
 
   // Modify processAgentTurn to await playVoiceResponse and return its promise
   const processAgentTurn = async (
@@ -273,7 +290,7 @@ function App() {
     if (isPodcastMode) {
       // Only trigger narration if we don't already have a script
       if (podcastScript) return;
-      setIsLoading(true);
+      setIsPodcastLoading(true);
       setError(null);
       // Request podcast script from backend
       try {
@@ -299,31 +316,51 @@ function App() {
         });
         const data = await response.json();
         if (!response.ok) {
-          setIsLoading(false);
+          setIsPodcastLoading(false);
           setError(data.error || 'Failed to process message for podcast script');
           return;
         }
-        if (data.is_podcast_mode && data.response) {
-          setPodcastScript(data.response);
-          // Parse script into turns (skip section headers and non-agent lines)
+        if (data.is_podcast_mode && data.response && typeof data.response === 'string' && data.response.trim().length > 0) {
+          setPodcastTurns([]);
+          setPodcastCurrentTurn(0);
+          setPodcastNarrationActive(false);
+          setIsPodcastInterrupted(false);
+          setPodcastResumeIndex(0);
+          setIsPodcastLoading(false);
+          setThinkingAgentId(null);
+          setPodcastMainScript(null);
+          // Now proceed to parse and start the new podcast
+          setPodcastMainScript(data.response);
+          if (!discussionHistory.some(line => line.startsWith('PODCAST_SCRIPT:'))) {
+            setDiscussionHistory(prev => [...prev, `PODCAST_SCRIPT:${data.response}`]);
+          }
+          // Robust parsing: trim lines, ignore empty lines, handle markdown
           const turns = [];
           const lines = data.response.split('\n');
+          let turnCounter = 0;
           for (let line of lines) {
-            const match = line.match(/^(Agent [12]):\s*(.*)$/);
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const match = trimmed.match(/^\**\s*Agent\s([12])\s*\**:?\s*(.*)$/i);
             if (match) {
-              turns.push({ agent: match[1], text: match[2] });
+              turns.push({ agent: `Agent ${match[1]}`, text: match[2], turnNumber: turnCounter++ });
             }
-            // else: skip section headers or any non-agent lines
+          }
+          console.log('Parsed podcast turns:', turns);
+          if (turns.length === 0) {
+            setIsPodcastLoading(false);
+            setError('Podcast script was empty or invalid. Raw script: ' + data.response);
+            return;
           }
           setPodcastTurns(turns);
           setPodcastCurrentTurn(0);
-          setPodcastNarrationActive(true); // <-- Start narration
-          setIsLoading(false);
-          setThinkingAgentId(null); // <-- Never set 'Thinking' in podcast mode
+          setPodcastNarrationActive(true);
+          setIsPodcastLoading(false);
+          setThinkingAgentId(null);
           return;
         }
       } catch (err) {
-        setIsLoading(false);
+        setIsPodcastLoading(false);
         setError('Podcast script error: ' + err.message);
         return;
       }
@@ -379,20 +416,18 @@ function App() {
         ));
         if (isSingleAgent) {
           setDiscussionHistory(prev => {
-            if (isInitialPrompt) {
-              return [...prev, `User: ${messageContext}`, `Agent: ${data.response}`];
-            } else {
-              return [...prev, `Agent: ${data.response}`];
-            }
+            setConversationTranscript(tprev => [...tprev, `Agent: ${cleanTextForTranscript(data.response)}`]);
+            return [...prev, `User: ${messageContext}`, `Agent: ${data.response}`];
           });
         } else {
-          setDiscussionHistory(prev => [...prev, `Agent ${agentId}: ${data.response}`]);
+          setDiscussionHistory(prev => {
+            setConversationTranscript(tprev => [...tprev, `Agent ${agentId}: ${cleanTextForTranscript(data.response)}`]);
+            return [...prev, `Agent ${agentId}: ${data.response}`];
+          });
         }
         setThinkingAgentId(null);
-        setIsNarrating(true);
-        if (myToken === currentRequestToken.current) {
-          await playVoiceResponse(data.response, agentId);
-        }
+        // --- Pipeline: push to narration queue instead of awaiting narration ---
+        setNarrationQueue(q => [...q, { agentId, text: data.response, token: myToken }]);
       }
       if (myToken === currentRequestToken.current) {
         setIsLoading(false);
@@ -414,6 +449,8 @@ function App() {
     setDiscussionHistory([]);
     setLastUserPrompt(null);
     setAgents(prev => prev.map(agent => ({ ...agent, messages: [] })));
+    setConversationTranscript([]);
+    setContextResetFlag(flag => flag + 1);
   };
 
   // Show reset dialog and store what triggered it
@@ -442,7 +479,7 @@ function App() {
 
   // --- Patch model selection to ask for reset ---
   const handleModelSelection = (model) => {
-    if (isDiscussionActive || isRouterProcessing || isNarrating) return; // Prevent model change during discussion, router processing, or narration
+    if (isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading) return; // Prevent model change during discussion, router processing, narration, or podcast loading
     setNewAgentModel('');
     setModelSelectionOpen(false);
 
@@ -475,7 +512,7 @@ function App() {
 
   // --- Patch file upload to ask for reset ---
   const handleFileUpload = async (event) => {
-    if (isDiscussionActive || isRouterProcessing || isNarrating) return; // Prevent file upload during discussion, router processing, or narration
+    if (isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading) return; // Prevent file upload during discussion, router processing, narration, or podcast loading
     const file = event.target.files[0];
     if (!file) return;
 
@@ -519,7 +556,7 @@ function App() {
       onClick={() => handleAskResetContext('manual')}
       color="warning"
       sx={{ minWidth: '150px', fontWeight: 'bold', mr: 2 }}
-      disabled={isDiscussionActive || isRouterProcessing || isNarrating}
+      disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}
     >
       Reset Context
     </Button>
@@ -543,7 +580,7 @@ function App() {
     </Dialog>
   );
 
-  // Utility: Interrupt all ongoing narration, audio, and discussion
+  // Utility: Interrupt all ongoing narration, audio, and discussion (soft interrupt)
   const interruptAll = () => {
     // Stop TTS/audio for previous requests
     if (audioRef.current) {
@@ -564,22 +601,216 @@ function App() {
     setIsDiscussionActive(false);
     setDiscussionTurn(0);
     setDiscussionAgents([]);
-    // Release the mutex lock if held
+    setPodcastScript(null);
+    // DO NOT clear podcastTurns or reset podcastCurrentTurn
+    setPodcastNarrationActive(false);
+    setIsPodcastLoading(false);
     if (currentUnlockRef.current) {
       currentUnlockRef.current();
       currentUnlockRef.current = null;
     }
-    // Increment request token to invalidate previous async responses
+    setNarrationQueue([]);
+    setIsNarratingQueue(false);
     currentRequestToken.current += 1;
-    // Do NOT block TTS for the next prompt; only stop previous audio
+  };
+
+  // Utility: Strict interrupt that clears all podcast turns and resets narration index
+  const strictInterruptAll = () => {
+    // Stop TTS/audio for previous requests
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+      if (audioRef.current.src) {
+        URL.revokeObjectURL(audioRef.current.src);
+        audioRef.current.src = '';
+      }
+    }
+    if (speechSynthesisRef.current) {
+      speechSynthesisRef.current.cancel();
+    }
+    setIsNarrating(false);
+    setIsPlayingAudio(false);
+    setSpeakingAgentId(null);
+    setThinkingAgentId(null);
+    setIsDiscussionActive(false);
+    setDiscussionTurn(0);
+    setDiscussionAgents([]);
+    setPodcastScript(null);
+    setPodcastTurns([]); // Clear all podcast turns
+    setPodcastCurrentTurn(0); // Reset narration index
+    setPodcastNarrationActive(false);
+    setIsPodcastLoading(false);
+    if (currentUnlockRef.current) {
+      currentUnlockRef.current();
+      currentUnlockRef.current = null;
+    }
+    setNarrationQueue([]);
+    setIsNarratingQueue(false);
+    currentRequestToken.current += 1;
+    // Do NOT clear discussionHistory so LLM can use it for future context
   };
 
   // Accept optional prompt param for handleSend
   const handleSend = async (promptOverride) => {
+    interruptAll();
     const prompt = typeof promptOverride === 'string' ? promptOverride : input.trim();
     if (!prompt || !currentDocument) return;
     setInput('');
-    interruptAll();
+    // If podcast narration is active, interrupt and do Q&A
+    if (isPodcastMode && podcastNarrationActive && podcastTurns.length > 0) {
+      // Only stop audio/narration, do NOT clear podcastTurns or reset podcastCurrentTurn
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+        if (audioRef.current.src) {
+          URL.revokeObjectURL(audioRef.current.src);
+          audioRef.current.src = '';
+        }
+      }
+      if (speechSynthesisRef.current) {
+        speechSynthesisRef.current.cancel();
+      }
+      setIsNarrating(false);
+      setIsPlayingAudio(false);
+      setSpeakingAgentId(null);
+      setThinkingAgentId(null);
+      // Do NOT clear podcastTurns or reset podcastCurrentTurn
+      setIsPodcastInterrupted(true);
+      setIsPodcastQALoading(true); // Show Q&A loading indicator
+      setError(null);
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/process-message/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            document_id: currentDocument.id,
+            message: prompt,
+            agent_id: agents[0].id,
+            agent_model_type: agents[0].model || 'critical',
+            discussion_history: discussionHistory,
+            is_single_agent: agents.length === 1,
+            is_final_summary: false,
+            is_last_turn: false,
+            master_agent_id: agents[0].id,
+            is_podcast_mode: true,
+            is_podcast_interrupt: true,
+            main_podcast_context: podcastMainScript || podcastScript,
+            podcast_resume_index: podcastResumeIndex
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          setError(data.error || 'Failed to process podcast Q&A');
+          setIsPodcastQALoading(false);
+          return;
+        }
+        if (data.is_podcast_interrupt && data.response) {
+          // Robust parsing: trim lines, ignore empty lines, handle markdown
+          const qaTurns = [];
+          const lines = data.response.split('\n');
+          for (let line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const match = trimmed.match(/^\**\s*Agent\s([12])\s*\**:?\s*(.*)$/i);
+            if (match) {
+              qaTurns.push({ agent: `Agent ${match[1]}`, text: match[2] });
+            }
+          }
+          if (qaTurns.length === 0) {
+            setIsPodcastQALoading(false);
+            setError('Podcast Q&A script was empty or invalid. Raw script: ' + data.response);
+            return;
+          }
+          setMiniScriptTurns(qaTurns);
+          setMiniScriptNarrationActive(true);
+          setPodcastNarrationActive(false);
+          setIsPodcastQALoading(false);
+          return;
+        }
+      } catch (err) {
+        setIsPodcastQALoading(false);
+        setError('Podcast Q&A error: ' + err.message);
+        return;
+      }
+      return;
+    }
+    // --- Podcast Mode: Direct script generation, skip router logic ---
+    if (isPodcastMode) {
+      setIsPodcastLoading(true);
+      setError(null);
+      setPodcastScript(null);
+      setPodcastTurns([]);
+      setPodcastCurrentTurn(0);
+      setPodcastNarrationActive(false);
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/process-message/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            document_id: currentDocument.id,
+            message: prompt,
+            agent_id: agents[0].id,
+            agent_model_type: agents[0].model || 'critical',
+            discussion_history: discussionHistory,
+            is_single_agent: agents.length === 1,
+            is_final_summary: false,
+            is_last_turn: false,
+            master_agent_id: agents[0].id,
+            is_podcast_mode: true
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          setError(data.error || 'Failed to process podcast script');
+          setIsPodcastLoading(false);
+          return;
+        }
+        if (data.is_podcast_mode && data.response && typeof data.response === 'string' && data.response.trim().length > 0) {
+          setPodcastTurns([]);
+          setPodcastCurrentTurn(0);
+          setPodcastNarrationActive(false);
+          setIsPodcastInterrupted(false);
+          setPodcastResumeIndex(0);
+          setIsPodcastLoading(false);
+          setThinkingAgentId(null);
+          setPodcastMainScript(null);
+          setPodcastMainScript(data.response);
+          if (!discussionHistory.some(line => line.startsWith('PODCAST_SCRIPT:'))) {
+            setDiscussionHistory(prev => [...prev, `PODCAST_SCRIPT:${data.response}`]);
+          }
+          // Robust parsing: trim lines, ignore empty lines, handle markdown
+          const turns = [];
+          const lines = data.response.split('\n');
+          let turnCounter = 0;
+          for (let line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const match = trimmed.match(/^\**\s*Agent\s([12])\s*\**:?\s*(.*)$/i);
+            if (match) {
+              turns.push({ agent: `Agent ${match[1]}`, text: match[2], turnNumber: turnCounter++ });
+            }
+          }
+          console.log('Parsed podcast turns:', turns);
+          if (turns.length === 0) {
+            setIsPodcastLoading(false);
+            setError('Podcast script was empty or invalid. Raw script: ' + data.response);
+            return;
+          }
+          setPodcastTurns(turns);
+          setPodcastCurrentTurn(0);
+          setPodcastNarrationActive(true);
+          setIsPodcastLoading(false);
+          setThinkingAgentId(null);
+          return;
+        }
+      } catch (err) {
+        setIsPodcastLoading(false);
+        setError('Podcast script error: ' + err.message);
+        return;
+      }
+      return;
+    }
+    // --- Normal prompt routing logic (never runs in podcast mode) ---
     const thisRequestToken = ++currentRequestToken.current;
     setLastUserPrompt(prompt);
     setDiscussionHistory(prev => [...prev, `User: ${prompt}`]);
@@ -592,9 +823,13 @@ function App() {
       setPodcastTurns([]);
       setPodcastCurrentTurn(0);
       setPodcastNarrationActive(false);
+      setIsPodcastLoading(false);
     }
     // Always send to backend and let backend decide the flow
     try {
+      if (!isPodcastMode) {
+        setConversationTranscript(tprev => [...tprev, `User: ${cleanTextForTranscript(prompt)}`]);
+      }
       const response = await fetch('http://127.0.0.1:8000/api/process-message/', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -745,7 +980,7 @@ function App() {
   const stopListening = () => {
     setListening(false);
     SpeechRecognition.stopListening();
-    if (transcript.trim()) handleSend(transcript.trim());
+    if (speechRecognitionTranscript.trim()) handleSend(speechRecognitionTranscript.trim());
   };
 
   // Status logic for each agent
@@ -802,10 +1037,10 @@ function App() {
   }, [browserSupportsSpeechRecognition]);
 
   useEffect(() => {
-    if (transcript) {
-      setInput(transcript);
+    if (speechRecognitionTranscript) {
+      setInput(speechRecognitionTranscript);
     }
-  }, [transcript]);
+  }, [speechRecognitionTranscript]);
 
   // Modify the Model Selection Dialog
   const ModelSelectionDialog = () => {
@@ -832,7 +1067,7 @@ function App() {
             value={newAgentModel}
             label="Model Type"
             onChange={(e) => setNewAgentModel(e.target.value)}
-              disabled={isDiscussionActive || isRouterProcessing || isNarrating}
+              disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}
             >
               {modelOptions.map(option => (
                 <MenuItem 
@@ -850,7 +1085,7 @@ function App() {
       <DialogActions>
         <Button 
           onClick={() => handleModelSelection(newAgentModel)} 
-            disabled={!newAgentModel || isDiscussionActive || usedModels.includes(newAgentModel) || isRouterProcessing || isNarrating}
+            disabled={!newAgentModel || isDiscussionActive || usedModels.includes(newAgentModel) || isRouterProcessing || isNarrating || isPodcastLoading}
           variant="contained"
         >
           Confirm
@@ -886,12 +1121,12 @@ function App() {
           inputProps={{ min: 3, step: 2 }}
           fullWidth
           sx={{ mt: 2 }}
-          disabled={isDiscussionActive || isRouterProcessing || isNarrating}
+          disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}
         />
       </DialogContent>
       <DialogActions>
         <Button onClick={handleCloseSettings}>Cancel</Button>
-        <Button onClick={handleSaveSettings} variant="contained" disabled={isDiscussionActive || isRouterProcessing || isNarrating}>Save</Button>
+        <Button onClick={handleSaveSettings} variant="contained" disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}>Save</Button>
       </DialogActions>
     </Dialog>
   );
@@ -900,13 +1135,13 @@ function App() {
   useEffect(() => {
     if (isPodcastMode && podcastNarrationActive && podcastTurns.length > 0) {
       let cancelled = false;
+      const narrationToken = currentRequestToken.current;
       const narrate = async () => {
-        for (let i = 0; i < podcastTurns.length; i++) {
-          if (cancelled) break;
+        for (let i = podcastCurrentTurn; i < podcastTurns.length; i++) {
+          if (cancelled || narrationToken !== currentRequestToken.current) break;
           const turn = podcastTurns[i];
-          // Set agent states: speaking/listening
           setSpeakingAgentId(turn.agent === 'Agent 1' ? 1 : 2);
-          setThinkingAgentId(null); // <-- Never set 'Thinking' in podcast mode
+          setThinkingAgentId(null);
           setIsNarrating(true);
           // Request TTS for this line
           try {
@@ -917,6 +1152,7 @@ function App() {
             });
             if (!ttsRes.ok) throw new Error('TTS failed');
             const audioBlob = await ttsRes.blob();
+            if (!audioBlob || audioBlob.size === 0) throw new Error('TTS returned empty audio');
             const audioUrl = URL.createObjectURL(audioBlob);
             if (audioRef.current) {
               if (audioRef.current.src) URL.revokeObjectURL(audioRef.current.src);
@@ -926,41 +1162,212 @@ function App() {
                   URL.revokeObjectURL(audioUrl);
                   resolve();
                 };
-                audioRef.current.onerror = reject;
+                audioRef.current.onerror = (e) => {
+                  if (narrationToken !== currentRequestToken.current || cancelled) {
+                    // Interruption: do not set error state, just exit
+                    resolve();
+                    return;
+                  }
+                  setError('Podcast TTS error: playback failed.');
+                  setIsNarrating(false);
+                  setPodcastNarrationActive(false);
+                  setIsPodcastLoading(false);
+                  resolve(); // resolve instead of reject for interruption safety
+                };
                 audioRef.current.play();
               });
             }
           } catch (err) {
-            setError('Podcast TTS error: ' + err.message);
+            if (narrationToken !== currentRequestToken.current || cancelled) {
+              // Interruption: do not set error state
+              break;
+            }
+            setError('Podcast TTS error: ' + (err && err.message ? err.message : 'Unknown error'));
+            setIsNarrating(false);
+            setPodcastNarrationActive(false);
+            setIsPodcastLoading(false);
+            break;
+          }
+          // Advance the narration index after each turn
+          setPodcastCurrentTurn(prev => prev + 1);
+          setMainDialogNumber(turn.turnNumber + 1); // Track dialog number for resuming
+        }
+        // End narration when all turns are done
+        if (narrationToken === currentRequestToken.current && !cancelled) {
+          setSpeakingAgentId(null);
+          setIsNarrating(false);
+          setPodcastNarrationActive(false);
+          console.log('[Main Narration] Finished all turns', {
+            podcastCurrentTurn,
+            mainDialogNumber,
+            podcastTurnsLength: podcastTurns.length
+          });
+        }
+        setIsPodcastLoading(false); // Always clear loading popup after narration ends or is interrupted
+      };
+      narrate();
+      return () => {
+        cancelled = true;
+        setIsPodcastLoading(false); // Always clear loading popup on cleanup/interruption
+      };
+    }
+  }, [isPodcastMode, podcastNarrationActive, podcastTurns]);
+
+  // Add Stop/Interrupt Button component
+  const StopInterruptButton = () => (
+    <Button
+      variant="contained"
+      color="error"
+      onClick={strictInterruptAll}
+      sx={{
+        mt: 2,
+        minWidth: 0,
+        p: 1.5,
+        borderRadius: '50%',
+        boxShadow: 2,
+        fontWeight: 'bold',
+        fontSize: 24,
+        width: 56,
+        height: 56,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+      aria-label="Stop/Interrupt"
+      title="Stop/Interrupt"
+    >
+      &#10006;
+    </Button>
+  );
+
+  // Show Stop/Interrupt button only if something is active (but NOT during prompt processing)
+  const showStopButton = isNarrating || isDiscussionActive || isPodcastLoading || podcastNarrationActive || isPlayingAudio;
+
+  // --- Mini Script (Q&A) Narration Effect ---
+  useEffect(() => {
+    if (miniScriptNarrationActive && miniScriptTurns.length > 0) {
+      let cancelled = false;
+      const narrationToken = currentRequestToken.current;
+      const narrateMini = async () => {
+        for (let i = 0; i < miniScriptTurns.length; i++) {
+          if (cancelled || narrationToken !== currentRequestToken.current) break;
+          const turn = miniScriptTurns[i];
+          setSpeakingAgentId(turn.agent === 'Agent 1' ? 1 : 2);
+          setThinkingAgentId(null);
+          setIsNarrating(true);
+          try {
+            const ttsRes = await fetch('http://127.0.0.1:8000/api/podcast-tts/', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ script: `${turn.agent}: ${turn.text}` })
+            });
+            if (!ttsRes.ok) throw new Error('TTS failed');
+            const audioBlob = await ttsRes.blob();
+            if (!audioBlob || audioBlob.size === 0) throw new Error('TTS returned empty audio');
+            const audioUrl = URL.createObjectURL(audioBlob);
+            if (audioRef.current) {
+              if (audioRef.current.src) URL.revokeObjectURL(audioRef.current.src);
+              audioRef.current.src = audioUrl;
+              await new Promise((resolve, reject) => {
+                audioRef.current.onended = () => {
+                  URL.revokeObjectURL(audioUrl);
+                  resolve();
+                };
+                audioRef.current.onerror = (e) => {
+                  if (narrationToken !== currentRequestToken.current || cancelled) {
+                    resolve();
+                    return;
+                  }
+                  setError('Podcast TTS error: playback failed.');
+                  setIsNarrating(false);
+                  setMiniScriptNarrationActive(false);
+                  resolve();
+                };
+                audioRef.current.play();
+              });
+            }
+          } catch (err) {
+            if (narrationToken !== currentRequestToken.current || cancelled) {
+              break;
+            }
+            setError('Podcast TTS error: ' + (err && err.message ? err.message : 'Unknown error'));
+            setIsNarrating(false);
+            setMiniScriptNarrationActive(false);
             break;
           }
         }
+        // After Q&A, resume main script at mainDialogNumber
         setSpeakingAgentId(null);
         setIsNarrating(false);
-        setPodcastNarrationActive(false);
+        setMiniScriptNarrationActive(false);
+        const resumeIndex = Math.min(mainDialogNumber, podcastTurns.length - 1);
+        console.log('[Mini Script Narration] Finished Q&A, resuming main script', {
+          requestedResumeAt: mainDialogNumber,
+          actualResumeIndex: resumeIndex,
+          podcastTurnsLength: podcastTurns.length
+        });
+        if (resumeIndex < podcastTurns.length) {
+          setPodcastCurrentTurn(resumeIndex);
+          setPodcastNarrationActive(true);
+        } else {
+          console.log('[Mini Script Narration] No more main script turns to resume.');
+        }
       };
-      narrate();
+      narrateMini();
       return () => { cancelled = true; };
     }
-  }, [isPodcastMode, podcastNarrationActive, podcastTurns]);
+  }, [miniScriptNarrationActive, miniScriptTurns, mainDialogNumber]);
 
   return (
     <Container maxWidth="xl" sx={{ height: '100vh', display: 'flex', flexDirection: 'column', py: 2, position: 'relative' }}>
       {agents.length > 1 && (
         <Box sx={{ position: 'fixed', bottom: 24, right: 24, zIndex: 10 }}>
-          <Button onClick={handleOpenSettings} variant="outlined" startIcon={<SettingsIcon />} sx={{ minWidth: 0, p: 1, borderRadius: '50%' }} disabled={isDiscussionActive || isRouterProcessing || isNarrating} />
+          <Button onClick={handleOpenSettings} variant="outlined" startIcon={<SettingsIcon />} sx={{ minWidth: 0, p: 1, borderRadius: '50%' }} disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading} />
         </Box>
       )}
       {agents.length > 1 && (
-        <Box sx={{ position: 'fixed', top: '50%', right: 24, transform: 'translateY(-50%)', zIndex: 11 }}>
+        <Box sx={{ position: 'fixed', top: 32, right: 32, zIndex: 11, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2 }}>
           <Button
             variant={isPodcastMode ? 'contained' : 'outlined'}
             color={isPodcastMode ? 'secondary' : 'primary'}
             onClick={() => setIsPodcastMode((prev) => !prev)}
-            sx={{ minWidth: 0, p: 1.5, borderRadius: '50%', boxShadow: isPodcastMode ? 3 : 1 }}
+            sx={{ minWidth: 160, borderRadius: 1, boxShadow: isPodcastMode ? 3 : 1, fontWeight: 'bold', px: 3 }}
           >
             {isPodcastMode ? '🎙️ Podcast Mode ON' : '🎙️ Podcast Mode'}
           </Button>
+          {conversationTranscript.length > 0 && !isPodcastMode && (
+            <Button
+              variant="contained"
+              color="success"
+              startIcon={<DownloadIcon />}
+              onClick={() => {
+                const formattedTranscript = conversationTranscript.map((line, index) => {
+                  if (index > 0 && (line.startsWith('User:') || line.startsWith('Agent'))) {
+                    return `\n${line}`;
+                  }
+                  return line;
+                }).join('\n');
+                const header = `Conversation Transcript\n${'='.repeat(50)}\n`;
+                const documentInfo = currentDocument ? `Document: ${currentDocument.filename}\n` : '';
+                const timestamp = `Generated: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
+                const fullTranscript = header + documentInfo + timestamp + formattedTranscript;
+                const blob = new Blob([fullTranscript], { type: 'text/plain' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = currentDocument ? `${currentDocument.filename.replace(/\.[^/.]+$/, '')}_transcript.txt` : 'transcript.txt';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => {
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                }, 0);
+              }}
+              sx={{ minWidth: 180, borderRadius: 1, fontWeight: 'bold', px: 3 }}
+            >
+              Download Transcript
+            </Button>
+          )}
         </Box>
       )}
       <SettingsDialog />
@@ -990,7 +1397,7 @@ function App() {
             variant="contained"
             startIcon={<CloudUploadIcon />}
             onClick={() => fileInputRef.current.click()}
-            disabled={isLoading || isDiscussionActive || isRouterProcessing || isNarrating}
+            disabled={isLoading || isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}
           >
             Upload Document
           </Button>
@@ -1013,7 +1420,7 @@ function App() {
               fontWeight: 'bold',
               display: agents.length >= 2 ? 'none' : 'flex'
             }}
-            disabled={agents.length >= 2 || isDiscussionActive || isRouterProcessing || isNarrating}
+            disabled={agents.length >= 2 || isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}
           >
             Add New Agent
           </Button>
@@ -1045,36 +1452,90 @@ function App() {
       )}
       {/* --- Voice Circle UI --- */}
       <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 0 }}>
+        {/* Podcast Loading Indicator */}
+        {isPodcastMode && isPodcastLoading && (
+          <Box sx={{ 
+            position: 'absolute', 
+            top: '50%', 
+            left: '50%', 
+            transform: 'translate(-50%, -50%)', 
+            zIndex: 15,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 2,
+            backgroundColor: 'rgba(255, 255, 255, 0.95)',
+            padding: 3,
+            borderRadius: 2,
+            boxShadow: 3
+          }}>
+            <CircularProgress size={60} color="secondary" />
+            <Typography variant="h6" color="secondary" sx={{ fontWeight: 'bold' }}>
+              🎙️ Generating ...
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              Creating an engaging conversation between the agents
+            </Typography>
+          </Box>
+        )}
+        {isPodcastQALoading && (
+          <Box sx={{ 
+            position: 'absolute', 
+            top: '50%', 
+            left: '50%', 
+            transform: 'translate(-50%, -50%)', 
+            zIndex: 15,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 2,
+            backgroundColor: 'rgba(255, 255, 255, 0.95)',
+            padding: 3,
+            borderRadius: 2,
+            boxShadow: 3
+          }}>
+            <CircularProgress size={60} color="secondary" />
+            <Typography variant="h6" color="secondary" sx={{ fontWeight: 'bold' }}>
+              🎙️ Processing your question for the podcast...
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              Generating a natural Q&A segment and resuming the main discussion
+            </Typography>
+          </Box>
+        )}
         <Box sx={{ mb: 4, display: 'flex', justifyContent: agents.length === 2 ? 'center' : 'flex-start', width: '100%' }}>
           {agents.length === 2 && (
             <Box sx={{ position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', zIndex: 2 }}>
-              <Button
-                variant="contained"
-                color={listening ? 'error' : 'primary'}
-                onClick={listening ? stopListening : startListening}
-                disabled={!currentDocument || !browserSupportsSpeechRecognition}
-                sx={{
-                  width: 90,
-                  height: 90,
-                  borderRadius: '50%',
-                  minWidth: 0,
-                  minHeight: 0,
-                  boxShadow: listening ? '0 0 0 8px #ff5252' : '0 0 0 8px #fffde7',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: 48,
-                  position: 'relative',
-                  zIndex: 2,
-                  transition: 'box-shadow 0.3s',
-                  backgroundColor: listening ? '#ff5252' : '#1976d2',
-                  '&:hover': {
-                    backgroundColor: listening ? '#d32f2f' : '#1565c0',
-                  },
-                }}
-              >
-                {listening ? <MicOffIcon sx={{ fontSize: 48 }} /> : <MicIcon sx={{ fontSize: 48 }} />}
-              </Button>
+              <div className="voice-mic-x-stack">
+                <Button
+                  variant="contained"
+                  color={listening ? 'error' : 'primary'}
+                  onClick={listening ? stopListening : startListening}
+                  disabled={!currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
+                  sx={{
+                    width: 90,
+                    height: 90,
+                    borderRadius: '50%',
+                    minWidth: 0,
+                    minHeight: 0,
+                    boxShadow: listening ? '0 0 0 8px #ff5252' : '0 0 0 8px #fffde7',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: 48,
+                    position: 'relative',
+                    zIndex: 2,
+                    transition: 'box-shadow 0.3s',
+                    backgroundColor: listening ? '#ff5252' : '#1976d2',
+                    '&:hover': {
+                      backgroundColor: listening ? '#d32f2f' : '#1565c0',
+                    },
+                  }}
+                >
+                  {listening ? <MicOffIcon sx={{ fontSize: 48 }} /> : <MicIcon sx={{ fontSize: 48 }} />}
+                </Button>
+                {showStopButton && <StopInterruptButton />}
+              </div>
             </Box>
           )}
         </Box>
@@ -1086,9 +1547,9 @@ function App() {
               <Box key={agent.id} sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flex: 1, minWidth: 220, position: 'relative' }}>
                 {/* Edit/Delete buttons */}
                 <Box sx={{ position: 'absolute', top: 8, right: 16, display: 'flex', gap: 1, zIndex: 3 }}>
-                  <Button size="small" onClick={() => changeModel(agent.id)} sx={{ minWidth: 0, p: 0.5 }} disabled={isDiscussionActive || isRouterProcessing || isNarrating}><EditIcon fontSize="small" /></Button>
+                  <Button size="small" onClick={() => changeModel(agent.id)} sx={{ minWidth: 0, p: 0.5 }} disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}><EditIcon fontSize="small" /></Button>
                   {agents.length > 1 && (
-                    <Button size="small" onClick={() => removeAgent(agent.id)} sx={{ minWidth: 0, p: 0.5 }} disabled={isDiscussionActive || isRouterProcessing || isNarrating}><CloseIcon fontSize="small" /></Button>
+                    <Button size="small" onClick={() => removeAgent(agent.id)} sx={{ minWidth: 0, p: 0.5 }} disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}><CloseIcon fontSize="small" /></Button>
                   )}
                 </Box>
                 <Box
@@ -1130,7 +1591,7 @@ function App() {
               variant="contained"
               color={listening ? 'error' : 'primary'}
               onClick={listening ? stopListening : startListening}
-              disabled={!currentDocument || !browserSupportsSpeechRecognition}
+              disabled={!currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
               sx={{
                 width: 90,
                 height: 90,
@@ -1153,6 +1614,7 @@ function App() {
             >
               {listening ? <MicOffIcon sx={{ fontSize: 48 }} /> : <MicIcon sx={{ fontSize: 48 }} />}
             </Button>
+            {showStopButton && <StopInterruptButton />}
           </Box>
         )}
         {/* --- Text Input for Prompt --- */}
@@ -1170,7 +1632,7 @@ function App() {
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyPress}
-            disabled={!currentDocument}
+            disabled={!currentDocument || isPodcastLoading}
             multiline
             minRows={1}
             maxRows={4}
@@ -1180,13 +1642,54 @@ function App() {
             color="primary"
             endIcon={<SendIcon />}
             onClick={() => handleSend()}
-            disabled={!input.trim() || !currentDocument}
+            disabled={!input.trim() || !currentDocument || isPodcastLoading}
             sx={{ height: 56 }}
           >
             Send
           </Button>
         </Box>
       </Box>
+      {/* --- Download Transcript Button (Normal Mode Only) --- */}
+      {!isPodcastMode && conversationTranscript.length > 0 && (
+        <Box sx={{ position: 'fixed', bottom: 24, left: 24, zIndex: 10 }}>
+          <Button
+            variant="contained"
+            color="secondary"
+            onClick={() => {
+              // Format transcript with proper spacing and structure
+              const formattedTranscript = conversationTranscript.map((line, index) => {
+                // Add a blank line before each new speaker for better readability
+                if (index > 0 && (line.startsWith('User:') || line.startsWith('Agent'))) {
+                  return `\n${line}`;
+                }
+                return line;
+              }).join('\n');
+              
+              // Add header information
+              const header = `Conversation Transcript\n${'='.repeat(50)}\n`;
+              const documentInfo = currentDocument ? `Document: ${currentDocument.filename}\n` : '';
+              const timestamp = `Generated: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
+              
+              const fullTranscript = header + documentInfo + timestamp + formattedTranscript;
+              
+              const blob = new Blob([fullTranscript], { type: 'text/plain' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = currentDocument ? `${currentDocument.filename.replace(/\.[^/.]+$/, '')}_transcript.txt` : 'transcript.txt';
+              document.body.appendChild(a);
+              a.click();
+              setTimeout(() => {
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+              }, 0);
+            }}
+            sx={{ minWidth: 0, p: 1.5, borderRadius: '50%', boxShadow: 2 }}
+          >
+            Download Transcript
+          </Button>
+        </Box>
+      )}
     </Container>
   );
 }
