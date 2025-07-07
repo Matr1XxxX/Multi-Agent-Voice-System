@@ -60,7 +60,7 @@ python manage.py runserver
 ### 2. Frontend Setup
 
 ```bash
-cd backend/voice_agent/voice_agent_frontend
+cd Multi-Agent-Voice-System/voice_agent/voice_agent_frontend
 npm install
 npm run build
 ```
