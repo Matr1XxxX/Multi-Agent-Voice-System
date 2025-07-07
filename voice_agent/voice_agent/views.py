@@ -773,6 +773,27 @@ def process_message(request):
                 'responding_agent_ids': responding_agent_ids,
                 'revised_prompt': revised_prompt
             }
+
+            # --- PATCH: If revised_prompt is a string but both Agent 1 and Agent 2 are mentioned, split it into a dict ---
+            if (
+                not isinstance(revised_prompt, dict)
+                and isinstance(responding_agent_ids, list)
+                and set(responding_agent_ids) == {1, 2}
+                and isinstance(revised_prompt, str)
+                and (('Agent 1' in revised_prompt or 'agent 1' in revised_prompt) and ('Agent 2' in revised_prompt or 'agent 2' in revised_prompt))
+            ):
+                # Try to split the prompt for each agent
+                agent1_match = re.search(r'(Agent 1[^A]*?)(?=Agent 2|$)', revised_prompt, re.IGNORECASE)
+                agent2_match = re.search(r'(Agent 2[^A]*?)(?=Agent 1|$)', revised_prompt, re.IGNORECASE)
+                agent1_instr = agent1_match.group(1).strip() if agent1_match else ''
+                agent2_instr = agent2_match.group(1).strip() if agent2_match else ''
+                # Clean up leading agent labels
+                agent1_instr = re.sub(r'^(Agent 1[:,]?\s*)', '', agent1_instr, flags=re.IGNORECASE)
+                agent2_instr = re.sub(r'^(Agent 2[:,]?\s*)', '', agent2_instr, flags=re.IGNORECASE)
+                # Only set if both found
+                if agent1_instr and agent2_instr:
+                    revised_prompt = {"1": agent1_instr, "2": agent2_instr}
+                    router_debug['revised_prompt'] = revised_prompt
         # --- Master agent summary logic ---
         if not is_single_agent and (is_final_summary or is_last_turn):
             logger.info("Generating final summary by master agent")
