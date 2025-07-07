@@ -1649,47 +1649,6 @@ function App() {
           </Button>
         </Box>
       </Box>
-      {/* --- Download Transcript Button (Normal Mode Only) --- */}
-      {!isPodcastMode && conversationTranscript.length > 0 && (
-        <Box sx={{ position: 'fixed', bottom: 24, left: 24, zIndex: 10 }}>
-          <Button
-            variant="contained"
-            color="secondary"
-            onClick={() => {
-              // Format transcript with proper spacing and structure
-              const formattedTranscript = conversationTranscript.map((line, index) => {
-                // Add a blank line before each new speaker for better readability
-                if (index > 0 && (line.startsWith('User:') || line.startsWith('Agent'))) {
-                  return `\n${line}`;
-                }
-                return line;
-              }).join('\n');
-              
-              // Add header information
-              const header = `Conversation Transcript\n${'='.repeat(50)}\n`;
-              const documentInfo = currentDocument ? `Document: ${currentDocument.filename}\n` : '';
-              const timestamp = `Generated: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
-              
-              const fullTranscript = header + documentInfo + timestamp + formattedTranscript;
-              
-              const blob = new Blob([fullTranscript], { type: 'text/plain' });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = currentDocument ? `${currentDocument.filename.replace(/\.[^/.]+$/, '')}_transcript.txt` : 'transcript.txt';
-              document.body.appendChild(a);
-              a.click();
-              setTimeout(() => {
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-              }, 0);
-            }}
-            sx={{ minWidth: 0, p: 1.5, borderRadius: '50%', boxShadow: 2 }}
-          >
-            Download Transcript
-          </Button>
-        </Box>
-      )}
     </Container>
   );
 }
