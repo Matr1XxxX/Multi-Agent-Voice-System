@@ -23,7 +23,6 @@ This project is a multi-agent conversational AI platform that enables document-d
 - **Text and Voice Input**: Interact via text or microphone
 - **TTS Narration**: All responses are narrated using pyttsx3 (local TTS)
 - **Final Summary**: Master agent provides a comprehensive, user-focused summary at the end
-- **Admin Review**: All discussions and podcast scripts are saved for admin review
 
 ---
 
@@ -47,7 +46,7 @@ This project is a multi-agent conversational AI platform that enables document-d
 ### 1. Backend Setup
 
 ```bash
-cd backend
+cd Multi-Agent-Voice-System
 pip install pipenv
 pipenv install
 pipenv shell
@@ -63,11 +62,10 @@ python manage.py runserver
 ```bash
 cd backend/voice_agent/voice_agent_frontend
 npm install
-npm start
+npm run build
 ```
 
-- The frontend runs on [http://localhost:3000](http://localhost:3000)
-- The backend API runs on [http://127.0.0.1:8000](http://127.0.0.1:8000)
+- The backend runs on [http://127.0.0.1:8000](http://127.0.0.1:8000) serving the static frontend files.
 
 ### 3. Ollama LLM Setup
 
@@ -117,11 +115,10 @@ npm start
 ## Project Structure
 
 ```
-backend/
+Multi-Agent-Voice-System/
   Pipfile / Pipfile.lock
   voice_agent/
     manage.py
-    db.sqlite3
     voice_agent/
       settings.py
       urls.py
@@ -136,7 +133,3 @@ backend/
 ```
 
 ---
-
-## License
-
-MIT License (or specify your own) 
