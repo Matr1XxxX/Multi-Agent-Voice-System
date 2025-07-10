@@ -31,6 +31,7 @@ import CloseIcon from '@mui/icons-material/Close';
 import ReplayIcon from '@mui/icons-material/Replay';
 import DownloadIcon from '@mui/icons-material/Download';
 import './App.css';
+import hpclLogo from './images/hpcl_logo.png';
 
 // Mutex class for narration lock
 class Mutex {
@@ -116,6 +117,8 @@ function App() {
   // Add state for mini script (Q&A) narration
   const [miniScriptTurns, setMiniScriptTurns] = useState([]);
   const [miniScriptNarrationActive, setMiniScriptNarrationActive] = useState(false);
+  // Add new state for pendingPodcastQA
+  const [pendingPodcastQA, setPendingPodcastQA] = useState(false);
 
   const fileInputRef = useRef(null);
   const audioRef = useRef(null);
@@ -136,6 +139,14 @@ function App() {
   const narrationMutex = useRef(new Mutex());
   // Add ref to track current unlock function for interruption
   const currentUnlockRef = useRef(null);
+
+  // Add new state for hands-free voice input
+  const [hasInterruptedOnSpeech, setHasInterruptedOnSpeech] = useState(false);
+  const [speechEndTimeout, setSpeechEndTimeout] = useState(null);
+  const [lastTranscript, setLastTranscript] = useState('');
+  const [isMicActive, setIsMicActive] = useState(false);
+  // Add new state for max listening timeout
+  const [maxListeningTimeout, setMaxListeningTimeout] = useState(null);
 
   // Modify the useEffect for initialization
   useEffect(() => {
@@ -556,7 +567,7 @@ function App() {
       onClick={() => handleAskResetContext('manual')}
       color="warning"
       sx={{ minWidth: '150px', fontWeight: 'bold', mr: 2 }}
-      disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}
+      disabled={disableUI}
     >
       Reset Context
     </Button>
@@ -616,6 +627,8 @@ function App() {
 
   // Utility: Strict interrupt that clears all podcast turns and resets narration index
   const strictInterruptAll = () => {
+    setIsRouterProcessing(false);
+    setIsLoading(false);
     // Stop TTS/audio for previous requests
     if (audioRef.current) {
       audioRef.current.pause();
@@ -656,8 +669,9 @@ function App() {
     const prompt = typeof promptOverride === 'string' ? promptOverride : input.trim();
     if (!prompt || !currentDocument) return;
     setInput('');
-    // If podcast narration is active, interrupt and do Q&A
-    if (isPodcastMode && podcastNarrationActive && podcastTurns.length > 0) {
+    // Route to podcast Q&A if podcast script is loaded and not in Q&A or loading
+    if (isPodcastMode && podcastTurns.length > 0 && !miniScriptNarrationActive && !isPodcastLoading) {
+      setPendingPodcastQA(true);
       // Only stop audio/narration, do NOT clear podcastTurns or reset podcastCurrentTurn
       if (audioRef.current) {
         audioRef.current.pause();
@@ -702,6 +716,7 @@ function App() {
         if (!response.ok) {
           setError(data.error || 'Failed to process podcast Q&A');
           setIsPodcastQALoading(false);
+          setPendingPodcastQA(false);
           return;
         }
         if (data.is_podcast_interrupt && data.response) {
@@ -719,17 +734,20 @@ function App() {
           if (qaTurns.length === 0) {
             setIsPodcastQALoading(false);
             setError('Podcast Q&A script was empty or invalid. Raw script: ' + data.response);
+            setPendingPodcastQA(false);
             return;
           }
           setMiniScriptTurns(qaTurns);
           setMiniScriptNarrationActive(true);
           setPodcastNarrationActive(false);
           setIsPodcastQALoading(false);
+          // pendingPodcastQA will be set to false after miniScriptNarrationActive is set to false (see below)
           return;
         }
       } catch (err) {
         setIsPodcastQALoading(false);
         setError('Podcast Q&A error: ' + err.message);
+        setPendingPodcastQA(false);
         return;
       }
       return;
@@ -810,7 +828,25 @@ function App() {
       }
       return;
     }
-    // --- Normal prompt routing logic (never runs in podcast mode) ---
+    // --- Single agent: skip router logic entirely ---
+    if (agents.length === 1) {
+      const thisRequestToken = ++currentRequestToken.current;
+      setLastUserPrompt(prompt);
+      setDiscussionHistory(prev => [...prev, `User: ${prompt}`]);
+      setIsLoading(true);
+      setError(null);
+      setIsRouterProcessing(false); // Ensure router indicator is off
+      setConversationTranscript(tprev => [...tprev, `User: ${cleanTextForTranscript(prompt)}`]);
+      try {
+        await processAgentTurn(agents[0].id, prompt, true, thisRequestToken);
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setIsLoading(false);
+      }
+      return;
+    }
+    // --- Multi-agent: router logic ---
     const thisRequestToken = ++currentRequestToken.current;
     setLastUserPrompt(prompt);
     setDiscussionHistory(prev => [...prev, `User: ${prompt}`]);
@@ -972,15 +1008,32 @@ function App() {
 
   // Central mic handlers (interrupt on listen)
   const startListening = () => {
-    interruptAll();
     resetTranscript();
-    setListening(true);
+    setIsMicActive(true);
+    setListening(true); // Immediately show 'Listening' state
+    setHasInterruptedOnSpeech(false);
+    setLastTranscript('');
     SpeechRecognition.startListening({ continuous: true });
+    // Start max listening timeout (10s)
+    if (maxListeningTimeout) clearTimeout(maxListeningTimeout);
+    const maxTimeout = setTimeout(() => {
+      setIsMicActive(false);
+      setListening(false);
+      setHasInterruptedOnSpeech(false);
+      setSpeechEndTimeout(null);
+      setMaxListeningTimeout(null);
+      SpeechRecognition.stopListening();
+      resetTranscript();
+      handleSend("Failed to understand prompt");
+    }, 10000);
+    setMaxListeningTimeout(maxTimeout);
   };
   const stopListening = () => {
+    setIsMicActive(false);
     setListening(false);
+    if (maxListeningTimeout) clearTimeout(maxListeningTimeout);
+    setMaxListeningTimeout(null);
     SpeechRecognition.stopListening();
-    if (speechRecognitionTranscript.trim()) handleSend(speechRecognitionTranscript.trim());
   };
 
   // Status logic for each agent
@@ -989,7 +1042,7 @@ function App() {
       if (speakingAgentId === agentId) return 'Speaking';
       return 'Listening';
     }
-    if (listening) return 'Listening';
+    if (listening) return 'Listening'; // Only true after user starts speaking
     if (speakingAgentId === agentId) return 'Speaking';
     if (thinkingAgentId === agentId) return 'Thinking';
     if (speakingAgentId || thinkingAgentId) return 'Listening';
@@ -1037,10 +1090,93 @@ function App() {
   }, [browserSupportsSpeechRecognition]);
 
   useEffect(() => {
-    if (speechRecognitionTranscript) {
+    if (isMicActive && !hasInterruptedOnSpeech && speechRecognitionTranscript) {
       setInput(speechRecognitionTranscript);
     }
-  }, [speechRecognitionTranscript]);
+  }, [isMicActive, hasInterruptedOnSpeech, speechRecognitionTranscript]);
+
+  // Add a robust interrupt handler for voice input
+  const handleInterruptVoiceInput = () => {
+    setIsMicActive(false);
+    setListening(false);
+    setHasInterruptedOnSpeech(false);
+    setLastTranscript('');
+    if (speechEndTimeout) clearTimeout(speechEndTimeout);
+    setSpeechEndTimeout(null);
+    if (maxListeningTimeout) clearTimeout(maxListeningTimeout);
+    setMaxListeningTimeout(null);
+    SpeechRecognition.stopListening();
+    resetTranscript();
+  };
+
+  // Refactor useEffect for speech detection and auto-processing
+  useEffect(() => {
+    // If transcript is non-empty and we haven't interrupted on speech, clear max listening timeout
+    if (isMicActive && speechRecognitionTranscript.trim() && !hasInterruptedOnSpeech) {
+      if (maxListeningTimeout) {
+        clearTimeout(maxListeningTimeout);
+        setMaxListeningTimeout(null);
+      }
+      interruptAll(); // Only interrupt when user actually starts speaking
+      setHasInterruptedOnSpeech(true);
+      setListening(true); // Already true, but ensure
+      setLastTranscript(speechRecognitionTranscript);
+      // Start the silence timer immediately on first speech
+      if (speechEndTimeout) clearTimeout(speechEndTimeout);
+      const timeout = setTimeout(() => {
+        setIsMicActive(false);
+        setListening(false);
+        setHasInterruptedOnSpeech(false);
+        setSpeechEndTimeout(null);
+        if (maxListeningTimeout) {
+          clearTimeout(maxListeningTimeout);
+          setMaxListeningTimeout(null);
+        }
+        SpeechRecognition.stopListening();
+        setInput(''); // Clear the text box before processing
+        const prompt = speechRecognitionTranscript.trim();
+        if (!prompt) {
+          handleSend("Question not clear, just reply based on previous question.");
+        } else {
+          handleSend(prompt);
+        }
+        resetTranscript();
+      }, 1500);
+      setSpeechEndTimeout(timeout);
+    }
+    // If listening and transcript changes, reset the speech end timer
+    if (isMicActive && hasInterruptedOnSpeech) {
+      if (speechRecognitionTranscript !== lastTranscript) {
+        setLastTranscript(speechRecognitionTranscript);
+        if (speechEndTimeout) clearTimeout(speechEndTimeout);
+        const timeout = setTimeout(() => {
+          setIsMicActive(false);
+          setListening(false);
+          setHasInterruptedOnSpeech(false);
+          setSpeechEndTimeout(null);
+          if (maxListeningTimeout) {
+            clearTimeout(maxListeningTimeout);
+            setMaxListeningTimeout(null);
+          }
+          SpeechRecognition.stopListening();
+          setInput(''); // Clear the text box before processing
+          const prompt = speechRecognitionTranscript.trim();
+          if (!prompt) {
+            handleSend("");
+          } else {
+            handleSend(prompt);
+          }
+          resetTranscript();
+        }, 1500);
+        setSpeechEndTimeout(timeout);
+      }
+    }
+    // Cleanup
+    return () => {
+      if (speechEndTimeout) clearTimeout(speechEndTimeout);
+      if (maxListeningTimeout) clearTimeout(maxListeningTimeout);
+    };
+  }, [isMicActive, speechRecognitionTranscript, hasInterruptedOnSpeech, lastTranscript]);
 
   // Modify the Model Selection Dialog
   const ModelSelectionDialog = () => {
@@ -1218,9 +1354,9 @@ function App() {
     <Button
       variant="contained"
       color="error"
-      onClick={strictInterruptAll}
+      onClick={isMicActive || listening ? handleInterruptVoiceInput : strictInterruptAll}
       sx={{
-        mt: 2,
+        mt: '2em',
         minWidth: 0,
         p: 1.5,
         borderRadius: '50%',
@@ -1240,8 +1376,8 @@ function App() {
     </Button>
   );
 
-  // Show Stop/Interrupt button only if something is active (but NOT during prompt processing)
-  const showStopButton = isNarrating || isDiscussionActive || isPodcastLoading || podcastNarrationActive || isPlayingAudio;
+  // Show Stop/Interrupt button whenever isMicActive or listening
+  const showStopButton = isMicActive || listening || isNarrating || isDiscussionActive || isPodcastLoading || podcastNarrationActive || isPlayingAudio;
 
   // --- Mini Script (Q&A) Narration Effect ---
   useEffect(() => {
@@ -1318,338 +1454,364 @@ function App() {
     }
   }, [miniScriptNarrationActive, miniScriptTurns, mainDialogNumber]);
 
+  // After miniScriptNarrationActive is set to false (in the mini script narration effect), setPendingPodcastQA(false)
+  useEffect(() => {
+    if (!miniScriptNarrationActive && pendingPodcastQA) {
+      setPendingPodcastQA(false);
+    }
+  }, [miniScriptNarrationActive, pendingPodcastQA]);
+
+  // Add a useEffect to automatically turn off podcast mode if agents.length goes from 2 to 1
+  useEffect(() => {
+    if (agents.length === 1 && isPodcastMode) {
+      setIsPodcastMode(false);
+    }
+  }, [agents.length, isPodcastMode]);
+
+  // Add a derived variable to determine if UI should be disabled
+  const disableUI = isNarrating || isLoading || isRouterProcessing || isPodcastLoading || podcastNarrationActive || isPodcastQALoading || isPlayingAudio;
+
   return (
-    <Container maxWidth="xl" sx={{ height: '100vh', display: 'flex', flexDirection: 'column', py: 2, position: 'relative' }}>
-      {agents.length > 1 && (
-        <Box sx={{ position: 'fixed', bottom: 24, right: 24, zIndex: 10 }}>
-          <Button onClick={handleOpenSettings} variant="outlined" startIcon={<SettingsIcon />} sx={{ minWidth: 0, p: 1, borderRadius: '50%' }} disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading} />
-        </Box>
-      )}
-      {agents.length > 1 && (
-        <Box sx={{ position: 'fixed', top: 32, right: 32, zIndex: 11, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2 }}>
-          <Button
-            variant={isPodcastMode ? 'contained' : 'outlined'}
-            color={isPodcastMode ? 'secondary' : 'primary'}
-            onClick={() => setIsPodcastMode((prev) => !prev)}
-            sx={{ minWidth: 160, borderRadius: 1, boxShadow: isPodcastMode ? 3 : 1, fontWeight: 'bold', px: 3 }}
-          >
-            {isPodcastMode ? '🎙️ Podcast Mode ON' : '🎙️ Podcast Mode'}
-          </Button>
-          {conversationTranscript.length > 0 && !isPodcastMode && (
+    <>
+      <header className="custom-header">
+        <div className="header-left">
+          <img src={hpclLogo} alt="HPCL Logo" className="header-logo main-logo" />
+          <span className="header-title">Hindustan Petroleum Corporation Limited</span>
+        </div>
+      </header>
+      <Container maxWidth="xl" sx={{ height: '100vh', display: 'flex', flexDirection: 'column', py: 2, position: 'relative', mt: 0 }}>
+        {agents.length > 1 && (
+          <Box sx={{ position: 'fixed', bottom: 24, right: 24, zIndex: 10 }}>
+            <Button onClick={handleOpenSettings} variant="outlined" startIcon={<SettingsIcon />} sx={{ minWidth: 0, p: 1, borderRadius: '50%' }} disabled={disableUI} />
+          </Box>
+        )}
+        <SettingsDialog />
+        <ModelSelectionDialog />
+        <ResetContextDialog />
+        <Paper 
+          elevation={3} 
+          sx={{
+            p: 2, 
+            mb: 2, 
+            display: 'flex', 
+            flexDirection: 'column',
+            gap: 2,
+            backgroundColor: '#f5f5f5'
+          }}
+        >
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <input
+              type="file"
+              accept=".pdf,.doc,.docx,.txt"
+              style={{ display: 'none' }}
+              ref={fileInputRef}
+              onChange={handleFileUpload}
+            />
+            <ResetContextButton />
             <Button
               variant="contained"
-              color="success"
-              startIcon={<DownloadIcon />}
-              onClick={() => {
-                const formattedTranscript = conversationTranscript.map((line, index) => {
-                  if (index > 0 && (line.startsWith('User:') || line.startsWith('Agent'))) {
-                    return `\n${line}`;
-                  }
-                  return line;
-                }).join('\n');
-                const header = `Conversation Transcript\n${'='.repeat(50)}\n`;
-                const documentInfo = currentDocument ? `Document: ${currentDocument.filename}\n` : '';
-                const timestamp = `Generated: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
-                const fullTranscript = header + documentInfo + timestamp + formattedTranscript;
-                const blob = new Blob([fullTranscript], { type: 'text/plain' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = currentDocument ? `${currentDocument.filename.replace(/\.[^/.]+$/, '')}_transcript.txt` : 'transcript.txt';
-                document.body.appendChild(a);
-                a.click();
-                setTimeout(() => {
-                  document.body.removeChild(a);
-                  URL.revokeObjectURL(url);
-                }, 0);
-              }}
-              sx={{ minWidth: 180, borderRadius: 1, fontWeight: 'bold', px: 3 }}
+              startIcon={<CloudUploadIcon />}
+              onClick={() => fileInputRef.current.click()}
+              disabled={disableUI}
             >
-              Download Transcript
+              Upload Document
             </Button>
+            {(conversationTranscript.length > 0 && !isPodcastMode) && (
+              <Button
+                variant="contained"
+                color="success"
+                startIcon={<DownloadIcon />}
+                onClick={() => {
+                  const formattedTranscript = conversationTranscript.map((line, index) => {
+                    if (index > 0 && (line.startsWith('User:') || line.startsWith('Agent'))) {
+                      return `\n${line}`;
+                    }
+                    return line;
+                  }).join('\n');
+                  const header = `Conversation Transcript\n${'='.repeat(50)}\n`;
+                  const documentInfo = currentDocument ? `Document: ${currentDocument.filename}\n` : '';
+                  const timestamp = `Generated: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
+                  const fullTranscript = header + documentInfo + timestamp + formattedTranscript;
+                  const blob = new Blob([fullTranscript], { type: 'text/plain' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = currentDocument ? `${currentDocument.filename.replace(/\.[^/.]+$/, '')}_transcript.txt` : 'transcript.txt';
+                  document.body.appendChild(a);
+                  a.click();
+                  setTimeout(() => {
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                  }, 0);
+                }}
+                sx={{ minWidth: 180, borderRadius: 1, fontWeight: 'bold', px: 3 }}
+                disabled={disableUI}
+              >
+                Download Transcript
+              </Button>
+            )}
+            {agents.length > 1 && (
+              <Button
+                variant={isPodcastMode ? 'contained' : 'outlined'}
+                color={isPodcastMode ? 'secondary' : 'primary'}
+                onClick={() => setIsPodcastMode((prev) => !prev)}
+                sx={{ minWidth: 160, borderRadius: 1, boxShadow: isPodcastMode ? 3 : 1, fontWeight: 'bold', px: 3 }}
+                disabled={disableUI}
+              >
+                {isPodcastMode ? '🎙️ Podcast Mode ON' : '🎙️ Podcast Mode'}
+              </Button>
+            )}
+            <Button
+              variant="contained"
+              startIcon={<AddIcon />}
+              onClick={addAgent}
+              color="secondary"
+              sx={{
+                minWidth: '150px',
+                backgroundColor: '#4caf50',
+                '&:hover': {
+                  backgroundColor: '#388e3c',
+                },
+                boxShadow: 2,
+                fontWeight: 'bold',
+                display: agents.length >= 2 ? 'none' : 'flex'
+              }}
+              disabled={agents.length >= 2 || disableUI}
+            >
+              Add New Agent
+            </Button>
+            <Typography variant="body2" color="text.secondary">
+              {currentDocument ? `Current document: ${currentDocument.filename}` : 'Supported formats: PDF, DOC, DOCX, TXT'}
+            </Typography>
+            <Box sx={{ flexGrow: 1 }} />
+          </Box>
+          {lastUserPrompt && (
+            <Paper
+              elevation={1}
+              sx={{
+                p: 2,
+                mt: 1,
+                backgroundColor: '#e0e0e0',
+                color: '#333',
+                fontWeight: 'bold'
+              }}
+            >
+              <Typography variant="subtitle1">Your Question:</Typography>
+              <Typography variant="body1" sx={{ mt: 0.5 }}>{lastUserPrompt}</Typography>
+            </Paper>
           )}
-        </Box>
-      )}
-      <SettingsDialog />
-      <ModelSelectionDialog />
-      <ResetContextDialog />
-      <Paper 
-        elevation={3} 
-        sx={{
-          p: 2, 
-          mb: 2, 
-          display: 'flex', 
-          flexDirection: 'column',
-          gap: 2,
-          backgroundColor: '#f5f5f5'
-        }}
-      >
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-          <input
-            type="file"
-            accept=".pdf,.doc,.docx,.txt"
-            style={{ display: 'none' }}
-            ref={fileInputRef}
-            onChange={handleFileUpload}
-          />
-          <ResetContextButton />
-          <Button
-            variant="contained"
-            startIcon={<CloudUploadIcon />}
-            onClick={() => fileInputRef.current.click()}
-            disabled={isLoading || isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}
+        </Paper>
+        {error && (
+          <Alert 
+            severity="error" 
+            sx={{ mb: 2 }}
+            onClose={() => setError(null)}
           >
-            Upload Document
-          </Button>
-          <Typography variant="body2" color="text.secondary">
-            {currentDocument ? `Current document: ${currentDocument.filename}` : 'Supported formats: PDF, DOC, DOCX, TXT'}
-          </Typography>
-          <Box sx={{ flexGrow: 1 }} />
-          <Button
-            variant="contained"
-            startIcon={<AddIcon />}
-            onClick={addAgent}
-            color="secondary"
-            sx={{
-              minWidth: '150px',
-              backgroundColor: '#4caf50',
-              '&:hover': {
-                backgroundColor: '#388e3c',
-              },
-              boxShadow: 2,
-              fontWeight: 'bold',
-              display: agents.length >= 2 ? 'none' : 'flex'
-            }}
-            disabled={agents.length >= 2 || isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}
-          >
-            Add New Agent
-          </Button>
-        </Box>
-        {lastUserPrompt && (
-          <Paper
-            elevation={1}
-            sx={{
-              p: 2,
-              mt: 1,
-              backgroundColor: '#e0e0e0',
-              color: '#333',
-              fontWeight: 'bold'
-            }}
-          >
-            <Typography variant="subtitle1">Your Question:</Typography>
-            <Typography variant="body1" sx={{ mt: 0.5 }}>{lastUserPrompt}</Typography>
-          </Paper>
+            {error}
+          </Alert>
         )}
-      </Paper>
-      {error && (
-        <Alert 
-          severity="error" 
-          sx={{ mb: 2 }}
-          onClose={() => setError(null)}
-        >
-          {error}
-        </Alert>
-      )}
-      {/* --- Voice Circle UI --- */}
-      <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 0 }}>
-        {/* Podcast Loading Indicator */}
-        {isPodcastMode && isPodcastLoading && (
-          <Box sx={{ 
-            position: 'absolute', 
-            top: '50%', 
-            left: '50%', 
-            transform: 'translate(-50%, -50%)', 
-            zIndex: 15,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: 2,
-            backgroundColor: 'rgba(255, 255, 255, 0.95)',
-            padding: 3,
-            borderRadius: 2,
-            boxShadow: 3
-          }}>
-            <CircularProgress size={60} color="secondary" />
-            <Typography variant="h6" color="secondary" sx={{ fontWeight: 'bold' }}>
-              🎙️ Generating ...
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
-              Creating an engaging conversation between the agents
-            </Typography>
-          </Box>
-        )}
-        {isPodcastQALoading && (
-          <Box sx={{ 
-            position: 'absolute', 
-            top: '50%', 
-            left: '50%', 
-            transform: 'translate(-50%, -50%)', 
-            zIndex: 15,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: 2,
-            backgroundColor: 'rgba(255, 255, 255, 0.95)',
-            padding: 3,
-            borderRadius: 2,
-            boxShadow: 3
-          }}>
-            <CircularProgress size={60} color="secondary" />
-            <Typography variant="h6" color="secondary" sx={{ fontWeight: 'bold' }}>
-              🎙️ Processing your question for the podcast...
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
-              Generating a natural Q&A segment and resuming the main discussion
-            </Typography>
-          </Box>
-        )}
-        <Box sx={{ mb: 4, display: 'flex', justifyContent: agents.length === 2 ? 'center' : 'flex-start', width: '100%' }}>
-          {agents.length === 2 && (
-            <Box sx={{ position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', zIndex: 2 }}>
-              <div className="voice-mic-x-stack">
-                <Button
-                  variant="contained"
-                  color={listening ? 'error' : 'primary'}
-                  onClick={listening ? stopListening : startListening}
-                  disabled={!currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
-                  sx={{
-                    width: 90,
-                    height: 90,
-                    borderRadius: '50%',
-                    minWidth: 0,
-                    minHeight: 0,
-                    boxShadow: listening ? '0 0 0 8px #ff5252' : '0 0 0 8px #fffde7',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: 48,
-                    position: 'relative',
-                    zIndex: 2,
-                    transition: 'box-shadow 0.3s',
-                    backgroundColor: listening ? '#ff5252' : '#1976d2',
-                    '&:hover': {
-                      backgroundColor: listening ? '#d32f2f' : '#1565c0',
-                    },
-                  }}
-                >
-                  {listening ? <MicOffIcon sx={{ fontSize: 48 }} /> : <MicIcon sx={{ fontSize: 48 }} />}
-                </Button>
-                {showStopButton && <StopInterruptButton />}
-              </div>
+        {/* --- Voice Circle UI --- */}
+        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 0 }}>
+          {/* Podcast Loading Indicator */}
+          {isPodcastMode && isPodcastLoading && (
+            <Box sx={{ 
+              position: 'absolute', 
+              top: '50%', 
+              left: '50%', 
+              transform: 'translate(-50%, -50%)', 
+              zIndex: 15,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 2,
+              backgroundColor: 'rgba(255, 255, 255, 0.95)',
+              padding: 3,
+              borderRadius: 2,
+              boxShadow: 3
+            }}>
+              <CircularProgress size={60} color="secondary" />
+              <Typography variant="h6" color="secondary" sx={{ fontWeight: 'bold' }}>
+                🎙️ Generating ...
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Creating an engaging conversation between the agents
+              </Typography>
             </Box>
           )}
-        </Box>
-        <Box sx={{ display: 'flex', flexDirection: { xs: 'column', md: 'row' }, alignItems: 'center', justifyContent: 'center', gap: 4, width: '100%' }}>
-          {agents.map((agent, idx) => {
-            const status = getAgentStatus(agent.id);
-            const color = modelColors[agent.model] || '#FFD600';
-            return (
-              <Box key={agent.id} sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flex: 1, minWidth: 220, position: 'relative' }}>
-                {/* Edit/Delete buttons */}
-                <Box sx={{ position: 'absolute', top: 8, right: 16, display: 'flex', gap: 1, zIndex: 3 }}>
-                  <Button size="small" onClick={() => changeModel(agent.id)} sx={{ minWidth: 0, p: 0.5 }} disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}><EditIcon fontSize="small" /></Button>
-                  {agents.length > 1 && (
-                    <Button size="small" onClick={() => removeAgent(agent.id)} sx={{ minWidth: 0, p: 0.5 }} disabled={isDiscussionActive || isRouterProcessing || isNarrating || isPodcastLoading}><CloseIcon fontSize="small" /></Button>
+          {isPodcastQALoading && (
+            <Box sx={{ 
+              position: 'absolute', 
+              top: '50%', 
+              left: '50%', 
+              transform: 'translate(-50%, -50%)', 
+              zIndex: 15,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 2,
+              backgroundColor: 'rgba(255, 255, 255, 0.95)',
+              padding: 3,
+              borderRadius: 2,
+              boxShadow: 3
+            }}>
+              <CircularProgress size={60} color="secondary" />
+              <Typography variant="h6" color="secondary" sx={{ fontWeight: 'bold' }}>
+                🎙️ Processing your question...
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Generating a natural Q&A segment and resuming the main discussion
+              </Typography>
+            </Box>
+          )}
+          <Box sx={{ mb: 4, display: 'flex', justifyContent: agents.length === 2 ? 'center' : 'flex-start', width: '100%' }}>
+            {agents.length === 2 && (
+              <Box sx={{ position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', zIndex: 2 }}>
+                <div className="voice-mic-x-stack">
+                  <Button
+                    variant="contained"
+                    color={listening ? 'error' : isMicActive ? 'info' : 'primary'}
+                    onClick={listening ? stopListening : startListening}
+                    disabled={!currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
+                    sx={{
+                      width: 60,
+                      height: 60,
+                      borderRadius: '50%',
+                      minWidth: 0,
+                      minHeight: 0,
+                      boxShadow: listening ? '0 0 0 8px #ff5252' : isMicActive ? '0 0 0 8px #2196f3' : '0 0 0 8px #fffde7',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: 48,
+                      position: 'relative',
+                      zIndex: 2,
+                      transition: 'box-shadow 0.3s',
+                      backgroundColor: listening ? '#ff5252' : isMicActive ? '#2196f3' : '#1976d2',
+                      '&:hover': {
+                        backgroundColor: listening ? '#d32f2f' : isMicActive ? '#1976d2' : '#1565c0',
+                      },
+                    }}
+                  >
+                    {listening ? <MicOffIcon sx={{ fontSize: 36 }} /> : isMicActive ? <MicIcon sx={{ fontSize: 36, color: 'info' }} /> : <MicIcon sx={{ fontSize: 36 }} />}
+                  </Button>
+                  {showStopButton && <StopInterruptButton />}
+                </div>
+              </Box>
+            )}
+          </Box>
+          <Box sx={{ display: 'flex', flexDirection: { xs: 'column', md: 'row' }, alignItems: 'center', justifyContent: 'center', gap: 4, width: '100%' }}>
+            {agents.map((agent, idx) => {
+              const status = getAgentStatus(agent.id);
+              const color = modelColors[agent.model] || '#FFD600';
+              return (
+                <Box key={agent.id} sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flex: 1, minWidth: 220, position: 'relative' }}>
+                  {/* Edit/Delete buttons */}
+                  <Box sx={{ position: 'absolute', top: 8, right: 16, display: 'flex', gap: 1, zIndex: 3 }}>
+                    <Button size="small" onClick={() => changeModel(agent.id)} sx={{ minWidth: 0, p: 0.5 }} disabled={disableUI}><EditIcon fontSize="small" /></Button>
+                    {agents.length > 1 && (
+                      <Button size="small" onClick={() => removeAgent(agent.id)} sx={{ minWidth: 0, p: 0.5 }} disabled={disableUI}><CloseIcon fontSize="small" /></Button>
+                    )}
+                  </Box>
+                  <Box
+                    className={`voice-circle${status === 'Speaking' ? ' speaking' : ''}${status === 'Listening' ? ' listening' : ''}`}
+                    sx={{
+                      width: { xs: 150, sm: 210 },
+                      height: { xs: 150, sm: 210 },
+                      borderRadius: '50%',
+                      background: `radial-gradient(circle at 60% 40%, ${color} 60%, #fff 100%)`,
+                      boxShadow: status === 'Speaking' ? `0 0 60px 20px ${color}` : `0 0 30px 8px ${color}`,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      position: 'relative',
+                      transition: 'box-shadow 0.3s',
+                      animation: status === 'Speaking' ? 'voicePulse 1.1s infinite' : undefined,
+                    }}
+                  />
+                  <Typography variant="h6" sx={{ mt: 3, fontWeight: 600, letterSpacing: 1 }}>
+                    {status}
+                  </Typography>
+                  <Typography variant="subtitle2" sx={{ mt: 1, color: '#888' }}>
+                    Agent {agent.id} ({agent.model})
+                  </Typography>
+                  {isLoading && thinkingAgentId === agent.id && status === 'Thinking' && (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', mt: 2 }}>
+                      <CircularProgress size={36} />
+                    </Box>
                   )}
                 </Box>
-                <Box
-                  className={`voice-circle${status === 'Speaking' ? ' speaking' : ''}${status === 'Listening' ? ' listening' : ''}`}
-                  sx={{
-                    width: { xs: 220, sm: 320 },
-                    height: { xs: 220, sm: 320 },
-                    borderRadius: '50%',
-                    background: `radial-gradient(circle at 60% 40%, ${color} 60%, #fff 100%)`,
-                    boxShadow: status === 'Speaking' ? `0 0 60px 20px ${color}` : `0 0 30px 8px ${color}`,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    position: 'relative',
-                    transition: 'box-shadow 0.3s',
-                    animation: status === 'Speaking' ? 'voicePulse 1.1s infinite' : undefined,
-                  }}
-                />
-                <Typography variant="h6" sx={{ mt: 3, fontWeight: 600, letterSpacing: 1 }}>
-                  {status}
-                </Typography>
-                <Typography variant="subtitle2" sx={{ mt: 1, color: '#888' }}>
-                  Agent {agent.id} ({agent.model})
-                </Typography>
-                {isLoading && thinkingAgentId === agent.id && status === 'Thinking' && (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', mt: 2 }}>
-                    <CircularProgress size={36} />
-                  </Box>
-                )}
-              </Box>
-            );
-          })}
-          <audio ref={audioRef} style={{ display: 'none' }} />
-        </Box>
-        {/* Show mic button at top if only one agent */}
-        {agents.length === 1 && (
-          <Box sx={{ mb: 4, display: 'flex', justifyContent: 'center', width: '100%' }}>
-            <Button
-              variant="contained"
-              color={listening ? 'error' : 'primary'}
-              onClick={listening ? stopListening : startListening}
-              disabled={!currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
-              sx={{
-                width: 90,
-                height: 90,
-                borderRadius: '50%',
-                minWidth: 0,
-                minHeight: 0,
-                boxShadow: listening ? '0 0 0 8px #ff5252' : '0 0 0 8px #fffde7',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                fontSize: 48,
-                position: 'relative',
-                zIndex: 2,
-                transition: 'box-shadow 0.3s',
-                backgroundColor: listening ? '#ff5252' : '#1976d2',
-                '&:hover': {
-                  backgroundColor: listening ? '#d32f2f' : '#1565c0',
-                },
-              }}
-            >
-              {listening ? <MicOffIcon sx={{ fontSize: 48 }} /> : <MicIcon sx={{ fontSize: 48 }} />}
-            </Button>
-            {showStopButton && <StopInterruptButton />}
+              );
+            })}
+            <audio ref={audioRef} style={{ display: 'none' }} />
           </Box>
-        )}
-        {/* --- Text Input for Prompt --- */}
-        <Box sx={{ mt: 4, width: { xs: '90%', sm: 500 }, display: 'flex', alignItems: 'center', gap: 2 }}>
-          {isRouterProcessing && (
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'text.secondary', fontSize: '0.875rem' }}>
-              <CircularProgress size={16} />
-              <span>Processing prompt...</span>
+          {/* Show mic button at top if only one agent */}
+          {agents.length === 1 && (
+            <Box sx={{ mb: 4, display: 'flex', justifyContent: 'center', width: '100%' }}>
+              <Button
+                variant="contained"
+                color={listening ? 'error' : isMicActive ? 'info' : 'primary'}
+                onClick={listening ? stopListening : startListening}
+                disabled={!currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
+                sx={{
+                  width: 60,
+                  height: 60,
+                  mt: '1em',
+                  borderRadius: '50%',
+                  minWidth: 0,
+                  minHeight: 0,
+                  boxShadow: listening ? '0 0 0 8px #ff5252' : isMicActive ? '0 0 0 8px #2196f3' : '0 0 0 8px #fffde7',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 48,
+                  position: 'relative',
+                  zIndex: 2,
+                  transition: 'box-shadow 0.3s',
+                  backgroundColor: listening ? '#ff5252' : isMicActive ? '#2196f3' : '#1976d2',
+                  '&:hover': {
+                    backgroundColor: listening ? '#d32f2f' : isMicActive ? '#1976d2' : '#1565c0',
+                  },
+                }}
+              >
+                {listening ? <MicOffIcon sx={{ fontSize: 36 }} /> : isMicActive ? <MicIcon sx={{ fontSize: 36, color: 'info' }} /> : <MicIcon sx={{ fontSize: 36 }} />}
+              </Button>
+              {showStopButton && <StopInterruptButton />}
             </Box>
           )}
-          <TextField
-            fullWidth
-            variant="outlined"
-            placeholder={currentDocument ? 'Type your question or prompt...' : 'Upload a document to start'}
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={handleKeyPress}
-            disabled={!currentDocument || isPodcastLoading}
-            multiline
-            minRows={1}
-            maxRows={4}
-          />
-          <Button
-            variant="contained"
-            color="primary"
-            endIcon={<SendIcon />}
-            onClick={() => handleSend()}
-            disabled={!input.trim() || !currentDocument || isPodcastLoading}
-            sx={{ height: 56 }}
-          >
-            Send
-          </Button>
+          {/* --- Text Input for Prompt --- */}
+          <Box sx={{ mt: 4, width: { xs: '90%', sm: 500 }, display: 'flex', alignItems: 'center', gap: 2 }}>
+            {isRouterProcessing && agents.length > 1 && (
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'text.secondary', fontSize: '0.875rem' }}>
+                <CircularProgress size={16} />
+                <span>Processing prompt...</span>
+              </Box>
+            )}
+            <TextField
+              fullWidth
+              variant="outlined"
+              placeholder={currentDocument ? 'Type your question or prompt...' : 'Upload a document to start'}
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={handleKeyPress}
+              disabled={!currentDocument || isPodcastLoading}
+              multiline
+              minRows={1}
+              maxRows={4}
+            />
+            <Button
+              variant="contained"
+              color="primary"
+              endIcon={<SendIcon />}
+              onClick={() => handleSend()}
+              disabled={!input.trim() || !currentDocument || isPodcastLoading}
+              sx={{ height: 56 }}
+            >
+              Send
+            </Button>
+          </Box>
         </Box>
-      </Box>
-    </Container>
+      </Container>
+    </>
   );
 }
 
