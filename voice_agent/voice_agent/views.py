@@ -20,18 +20,23 @@ import pyttsx3
 import json as pyjson
 import wave
 import audioop
+import numpy as np
+import faiss
+import time
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 # Ollama API configuration
-OLLAMA_API_URL = "http://localhost:11434/api"
+# OLLAMA_API_URL = "http://localhost:11434/api"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY = "SECRET_KEY"
 
 # Define agent configurations
 AGENT_CONFIGS = {
     "critical": {
         "name": "Critical Thinker",
-        "model": "llama3",
+        "model": "gemma2",
         "system_prompt": """
 You are Agent {agent_id}, a critical thinking AI assistant. Analyze information objectively and make reasoned judgments.It involves identifying problems, evaluating evidence, considering different perspectives.
 
@@ -51,6 +56,8 @@ STRICT RULES:
 - If no other agents are speicified in the prompt do not ask any questions.
 - Do not mention your agent type or theme unless asked.
 - Make your responses sound natural and human-like, with occasional stutters or emotion, but never add content not requested by the user.
+- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
+- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
 
 """,
         "temperature": 0.4,
@@ -61,7 +68,7 @@ STRICT RULES:
     },
     "analytical": {
         "name": "Analytical Thinker",
-        "model": "llama3",
+        "model": "gemma2",
         "system_prompt": """
 You are Agent {agent_id}, an analytical thinking AI assistant.Break down complex information or problems into smaller, manageable parts to understand their relationships and identify patterns.
 
@@ -81,6 +88,8 @@ STRICT RULES:
 - If no other agents are speicified in the prompt do not ask any questions.
 - Do not mention your agent type or theme unless asked.
 - Make your responses sound natural and human-like, with occasional stutters or emotion, but never add content not requested by the user.
+- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
+- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
 """,
         "temperature": 0.5,
         "top_p": 0.85,
@@ -110,6 +119,8 @@ STRICT RULES:
 - If no other agents are speicified in the prompt do not ask any questions.
 - Do not mention your agent type or theme unless asked.
 - Make your responses sound natural and human-like, with occasional stutters or emotion, but never add content not requested by the user.
+- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
+- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
 """,
         "temperature": 0.9,
         "top_p": 0.95,
@@ -139,6 +150,8 @@ STRICT RULES:
 - If no other agents are speicified in the prompt do not ask any questions.
 - Do not mention your agent type or theme unless asked.
 - Make your responses sound natural and human-like, with occasional stutters or emotion, but never add content not requested by the user.
+- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
+- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
 """,
         "temperature": 0.65,
         "top_p": 0.9,
@@ -151,7 +164,7 @@ STRICT RULES:
 # Add Podcast Mode LLM config
 PODCAST_CONFIG = {
     "name": "Podcast Script Generator",
-    "model": "llama3",
+    "model": "gemma2",
     "system_prompt": '''
 You are an expert podcast scriptwriter. Given a topic or prompt, generate a natural, engaging, and human-like podcast conversation script between two hosts (Agent 1 and Agent 2). The script should:
 - Start with a brief, friendly introduction by Agent 1, but do not mention it is a podcast or an episode. Also do not ask the viewers to tune in for the next time.
@@ -168,6 +181,8 @@ You are an expert podcast scriptwriter. Given a topic or prompt, generate a natu
 - Do NOT mention that this is AI-generated or reference the system prompt.
 - Make the conversation JUST mimic a real podcast not be an actual one, do not introduce the listener to SAID podcast, just make a brief introduction to the topic of discussion with human like analogies or talks and end with thoughts and insights..
 - Do NOT say things like "tune in next time" or "see you in the next episode".
+- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
+- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
 ''',
     "temperature": 0.85,
     "top_p": 0.95,
@@ -189,6 +204,8 @@ You are an expert podcast scriptwriter. The podcast is in progress, but a listen
 - Use clear speaker labels (Agent 1:, Agent 2:).
 - Do NOT mention that this is an interruption or break, just make it feel like a natural Q&A moment in the podcast.
 - Do NOT reference the system prompt or that this is AI-generated.
+- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
+- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
 ''',
     "temperature": 0.8,
     "top_p": 0.95,
@@ -196,6 +213,71 @@ You are an expert podcast scriptwriter. The podcast is in progress, but a listen
     "top_k": 60,
     "repeat_penalty": 1.1
 }
+
+# In-memory storage for FAISS indices and chunk texts, keyed by document id
+FAISS_INDICES = {}
+DOC_CHUNKS = {}
+# New: In-memory storage for discussion history embeddings and FAISS indices, keyed by document id
+DISCUSSION_FAISS_INDICES = {}
+DISCUSSION_CHUNKS = {}
+
+# Helper: Chunk text into paragraphs (or every ~500 words)
+def chunk_text(text, chunk_size=500):
+    paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+    chunks = []
+    current = []
+    current_len = 0
+    for para in paragraphs:
+        words = para.split()
+        if current_len + len(words) > chunk_size and current:
+            chunks.append(' '.join(current))
+            current = []
+            current_len = 0
+        current.extend(words)
+        current_len += len(words)
+    if current:
+        chunks.append(' '.join(current))
+    return chunks
+
+# Helper: Get embedding from Ollama nomic-embed-text
+def get_embedding_ollama(text):
+    response = requests.post(
+        "http://localhost:11434/api/embeddings",
+        json={"model": "nomic-embed-text", "prompt": text}
+    )
+    response.raise_for_status()
+    return response.json()["embedding"]
+
+# Helper: Build FAISS index for a list of chunk texts
+def build_faiss_index(chunks):
+    embeddings = [get_embedding_ollama(chunk) for chunk in chunks]
+    arr = np.array(embeddings).astype('float32')
+    dim = arr.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(arr)
+    return index, embeddings
+
+# Helper: Search FAISS for top_k similar chunks
+def search_faiss(query, index, chunks, embeddings, top_k=3):
+    query_emb = np.array([get_embedding_ollama(query)]).astype('float32')
+    D, I = index.search(query_emb, top_k)
+    return [chunks[i] for i in I[0]]
+
+# New: Update discussion history FAISS index for a document
+def update_discussion_faiss(document_id, discussion_history):
+    if not discussion_history:
+        DISCUSSION_FAISS_INDICES[document_id] = None
+        DISCUSSION_CHUNKS[document_id] = []
+        return
+    # Use each turn as a chunk
+    chunks = [turn for turn in discussion_history if turn.strip()]
+    if not chunks:
+        DISCUSSION_FAISS_INDICES[document_id] = None
+        DISCUSSION_CHUNKS[document_id] = []
+        return
+    index, embeddings = build_faiss_index(chunks)
+    DISCUSSION_FAISS_INDICES[document_id] = index
+    DISCUSSION_CHUNKS[document_id] = (chunks, embeddings)
 
 def format_response(text: str) -> str:
     """Format the response text as plain text for TTS and display (no HTML tags)."""
@@ -446,43 +528,40 @@ def generate_voice_response(request):
 def upload_document(request):
     try:
         logger.info("Received document upload request")
-        
         if 'file' not in request.FILES:
             logger.error("No file provided in request")
             return JsonResponse({'error': 'No file provided'}, status=400)
-        
         file = request.FILES['file']
         filename = file.name
         content_type = file.content_type
-        
         logger.info(f"Processing file: {filename} ({content_type})")
-        
-        # Create document instance
         document = Document.objects.create(
             file=file,
             filename=filename,
             content_type=content_type
         )
-        
-        # Save the file to the media directory
         file_path = os.path.join('media', filename)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, 'wb+') as destination:
             for chunk in file.chunks():
                 destination.write(chunk)
-        
-        # Store the file path in the document
         document.processed_text = file_path
         document.save()
-        
-        logger.info(f"Successfully processed document: {filename}")
-        
+        # --- New: Extract, chunk, embed, and build FAISS index ---
+        doc_text = extract_text_from_file(file_path)
+        chunks = chunk_text(doc_text)
+        if not chunks:
+            logger.error("No valid chunks extracted from document.")
+            return JsonResponse({'error': 'No valid text chunks in document.'}, status=400)
+        index, embeddings = build_faiss_index(chunks)
+        FAISS_INDICES[document.id] = index
+        DOC_CHUNKS[document.id] = (chunks, embeddings)
+        logger.info(f"Successfully processed and indexed document: {filename}")
         return JsonResponse({
             'id': document.id,
             'filename': document.filename,
-            'message': 'Document uploaded successfully'
+            'message': 'Document uploaded and indexed successfully'
         })
-        
     except Exception as e:
         logger.error(f"Error processing document: {str(e)}", exc_info=True)
         return JsonResponse({'error': str(e)}, status=500)
@@ -503,32 +582,23 @@ def process_message(request):
         master_agent_id = data.get('master_agent_id', agent_id_from_frontend)
         is_podcast_mode = data.get('is_podcast_mode', False)
         is_podcast_interrupt = data.get('is_podcast_interrupt', False)
-
         logger.info(f"Processing message from frontend for agent {agent_id_from_frontend} with model type {agent_model_type}")
         logger.info(f"Is final summary: {is_final_summary}, Is last turn: {is_last_turn}")
-
         if not document_id or not agent_id_from_frontend:
             return JsonResponse({'error': 'Missing document_id or agent_id'}, status=400)
-
-        # Get agent configuration based on model type
         agent_config = AGENT_CONFIGS.get(agent_model_type)
         if not agent_config:
             return JsonResponse({'error': f'Invalid model type: {agent_model_type}'}, status=400)
-
-        # Initialize router_debug with defaults for single agent or fallback
         router_debug = {
             'discussion_required': False,
             'initiator_agent_id': agent_id_from_frontend,
             'responding_agent_ids': [agent_id_from_frontend],
             'revised_prompt': message
         }
-
-        # Initialize router variables
         discussion_required = False
         initiator_agent_id = None
         revised_prompt = message
         responding_agent_ids = None
-
         agent_model = agent_config["model"]
         agent_system_prompt = agent_config["system_prompt"].format(agent_id=agent_id_from_frontend)
         agent_options = {
@@ -538,15 +608,31 @@ def process_message(request):
             "top_k": agent_config["top_k"],
             "repeat_penalty": agent_config["repeat_penalty"]
         }
-
         try:
             document = Document.objects.get(id=document_id)
         except Document.DoesNotExist:
             return JsonResponse({'error': 'Document not found'}, status=404)
-
-        file_path = document.processed_text
-        document_content = extract_text_from_file(file_path)
-
+        # --- Use FAISS retrieval for context ---
+        if document_id in FAISS_INDICES and document_id in DOC_CHUNKS:
+            index = FAISS_INDICES[document_id]
+            chunks, embeddings = DOC_CHUNKS[document_id]
+            top_doc_chunks = search_faiss(message, index, chunks, embeddings, top_k=1)
+            document_content = '\n'.join([truncate_chunk(chunk) for chunk in top_doc_chunks])
+        else:
+            file_path = document.processed_text
+            document_content = extract_text_from_file(file_path)
+        # --- Use FAISS retrieval for discussion history ---
+        if discussion_history:
+            update_discussion_faiss(document_id, discussion_history)
+            if document_id in DISCUSSION_FAISS_INDICES and DISCUSSION_FAISS_INDICES[document_id] is not None:
+                d_index = DISCUSSION_FAISS_INDICES[document_id]
+                d_chunks, d_embeddings = DISCUSSION_CHUNKS[document_id]
+                top_discussion_chunks = search_faiss(message, d_index, d_chunks, d_embeddings, top_k=1)
+                discussion_context = '\n'.join([truncate_chunk(chunk) for chunk in top_discussion_chunks])
+            else:
+                discussion_context = '\n'.join([truncate_chunk(turn) for turn in discussion_history])
+        else:
+            discussion_context = ''
         # --- Check for empty or invalid document content ---
         if not document_content or not document_content.strip() or document_content.lower().startswith('error reading file'):
             return JsonResponse({
@@ -559,16 +645,12 @@ def process_message(request):
                 'responding_agent_ids': None,
                 'revised_prompt': message
             })
-
         # --- Podcast Q&A Interruption Mode ---
         if is_podcast_mode and is_podcast_interrupt:
             podcast_qa_system_prompt = PODCAST_QA_CONFIG["system_prompt"]
             podcast_qa_options = {
                 "temperature": PODCAST_QA_CONFIG["temperature"],
                 "top_p": PODCAST_QA_CONFIG["top_p"],
-                "num_predict": PODCAST_QA_CONFIG["num_predict"],
-                "top_k": PODCAST_QA_CONFIG["top_k"],
-                "repeat_penalty": PODCAST_QA_CONFIG["repeat_penalty"]
             }
             main_podcast_context = data.get('main_podcast_context', '')
             podcast_resume_index = data.get('podcast_resume_index', 0)
@@ -578,24 +660,23 @@ def process_message(request):
                 {"role": "system", "content": podcast_qa_system_prompt},
                 {"role": "user", "content": qa_prompt}
             ]
-            response_ollama = requests.post(
-                f"{OLLAMA_API_URL}/chat",
+            response_groq = requests.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
                 json={
-                    "model": PODCAST_QA_CONFIG["model"],
+                    "model": "gemma2-9b-it",
                     "messages": podcast_qa_messages,
-                    "stream": False,
-                    "options": podcast_qa_options
+                    "temperature": podcast_qa_options["temperature"],
+                    "top_p": podcast_qa_options["top_p"]
                 }
             )
-            if response_ollama.status_code != 200:
-                raise Exception(f"Ollama API error: {response_ollama.text}")
-            result = response_ollama.json()
-            if 'message' in result:
-                answer = result['message']['content'].strip()
-            elif 'messages' in result and result['messages']:
-                answer = result['messages'][-1]['content'].strip()
-            else:
-                answer = ''
+            if response_groq.status_code != 200:
+                raise Exception(f"Groq API error: {response_groq.text}")
+            result = response_groq.json()
+            answer = result["choices"][0]["message"]["content"].strip() if "choices" in result and result["choices"] else ''
             chat_message = ChatMessage.objects.create(
                 document=document,
                 message=message,
@@ -613,34 +694,30 @@ def process_message(request):
             podcast_system_prompt = PODCAST_CONFIG["system_prompt"]
             podcast_options = {
                 "temperature": PODCAST_CONFIG["temperature"],
-                "top_p": PODCAST_CONFIG["top_p"],
-                "num_predict": PODCAST_CONFIG["num_predict"],
-                "top_k": PODCAST_CONFIG["top_k"],
-                "repeat_penalty": PODCAST_CONFIG["repeat_penalty"]
+                "top_p": PODCAST_CONFIG["top_p"]
             }
             podcast_prompt = f"Podcast Topic: {message}\n\nDocument Content (for reference):\n{document_content[:8000] if document_content else ''}"
             podcast_messages = [
                 {"role": "system", "content": podcast_system_prompt},
                 {"role": "user", "content": podcast_prompt}
             ]
-            response_ollama = requests.post(
-                f"{OLLAMA_API_URL}/chat",
+            response_groq = requests.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
                 json={
-                    "model": PODCAST_CONFIG["model"],
+                    "model": "gemma2-9b-it",
                     "messages": podcast_messages,
-                    "stream": False,
-                    "options": podcast_options
+                    "temperature": podcast_options["temperature"],
+                    "top_p": podcast_options["top_p"]
                 }
             )
-            if response_ollama.status_code != 200:
-                raise Exception(f"Ollama API error: {response_ollama.text}")
-            result = response_ollama.json()
-            if 'message' in result:
-                answer = result['message']['content'].strip()
-            elif 'messages' in result and result['messages']:
-                answer = result['messages'][-1]['content'].strip()
-            else:
-                answer = ''
+            if response_groq.status_code != 200:
+                raise Exception(f"Groq API error: {response_groq.text}")
+            result = response_groq.json()
+            answer = result["choices"][0]["message"]["content"].strip() if "choices" in result and result["choices"] else ''
             chat_message = ChatMessage.objects.create(
                 document=document,
                 message=message,
@@ -655,15 +732,13 @@ def process_message(request):
             })
 
         # --- Master LLM router step ---
-        # Only run router for the initial user prompt (not for agent-to-agent messages)
-        # Backend override: If only one agent is present, always skip router
-        if is_single_agent or (responding_agent_ids and len(responding_agent_ids) == 1):
+        # Only call router LLM if multi-agent (not single agent)
+        if is_single_agent:
             discussion_required = False
             initiator_agent_id = agent_id_from_frontend
             responding_agent_ids = [agent_id_from_frontend]
             revised_prompt = message
         elif not (is_final_summary or is_last_turn):
-            # Always run router for every user prompt (unless summary/last turn)
             router_system_prompt = (
                 "You are a prompt router for a multi-agent AI system. Given a user prompt and document content, answer ONLY in strict JSON format:\n"
                 "{\n"
@@ -718,14 +793,27 @@ def process_message(request):
             )
             router_messages = [
                 {"role": "system", "content": router_system_prompt},
-                {"role": "user", "content": f"Document: {document_content[:4000]}\nPrompt: {message}"}
+                {"role": "user", "content": f"Document: {document_content}\nDiscussion: {discussion_context}\nPrompt: {message}"}
             ]
-            router_response = requests.post(
-                f"{OLLAMA_API_URL}/chat",
-                json={"model": "llama3", "messages": router_messages, "stream": False}
+            # Log prompt size
+            prompt_size = sum(len(m['content']) for m in router_messages)
+            logger.info(f"Router LLM prompt size: {prompt_size} characters")
+            response_groq = requests.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gemma2-9b-it",
+                    "messages": router_messages,
+                    "temperature": 0.0,
+                    "top_p": 1.0
+                }
             )
-            if router_response.status_code != 200:
-                logger.error(f"Router LLM error: {router_response.text}")
+            logger.info(f"Router LLM response: {response_groq.status_code} {response_groq.text}")
+            if response_groq.status_code != 200:
+                logger.error(f"Router LLM error: {response_groq.text}")
                 return JsonResponse({
                     'error': 'Router LLM error',
                     'discussion_required': False,
@@ -733,8 +821,8 @@ def process_message(request):
                     'responding_agent_ids': None,
                     'revised_prompt': message
                 }, status=500)
-            router_result = router_response.json()
-            router_content = router_result.get('message', {}).get('content', '')
+            router_result = response_groq.json()
+            router_content = router_result.get('choices', [{}])[0].get('message', {}).get('content', '')
             match = re.search(r'\{[\s\S]*\}', router_content)
             if match:
                 try:
@@ -743,17 +831,15 @@ def process_message(request):
                     initiator_agent_id = router_json.get('initiator_agent_id', None)
                     revised_prompt = router_json.get('revised_prompt', message)
                     responding_agent_ids = router_json.get('responding_agent_ids', None)
-                    # Overwrite message and flow control
+                    if not responding_agent_ids:
+                        if discussion_required:
+                            responding_agent_ids = [1, 2]
+                        else:
+                            responding_agent_ids = [initiator_agent_id]
                     message = revised_prompt
-                    if discussion_required:
-                        is_single_agent = False
-                    elif responding_agent_ids:
-                        is_single_agent = False
-                    else:
-                        is_single_agent = True
+                    is_single_agent = False
                 except Exception as e:
                     logger.error(f"Router JSON parse error: {e}")
-                    # Default: Agent 1 handles the prompt
                     discussion_required = False
                     initiator_agent_id = 1
                     revised_prompt = message
@@ -761,7 +847,6 @@ def process_message(request):
                     is_single_agent = True
             else:
                 logger.error(f"Router LLM did not return valid JSON: {router_content}")
-                # Default: Agent 1 handles the prompt
                 discussion_required = False
                 initiator_agent_id = 1
                 revised_prompt = message
@@ -797,53 +882,39 @@ def process_message(request):
         # --- Master agent summary logic ---
         if not is_single_agent and (is_final_summary or is_last_turn):
             logger.info("Generating final summary by master agent")
-            # Use the master agent's config
-            master_agent_type = agent_model_type  # Use the same type as the current agent
+            master_agent_type = agent_model_type
             master_agent_config = AGENT_CONFIGS.get(master_agent_type)
-            master_agent_model = master_agent_config["model"]
+            master_agent_model = "gemma2-9b-it"
             master_agent_system_prompt = master_agent_config["system_prompt"].format(agent_id=master_agent_id)
             master_agent_options = {
                 "temperature": master_agent_config["temperature"],
-                "top_p": master_agent_config["top_p"],
-                "num_predict": master_agent_config["num_predict"],
-                "top_k": master_agent_config["top_k"],
-                "repeat_penalty": master_agent_config["repeat_penalty"]
+                "top_p": master_agent_config["top_p"]
             }
-
-            # Prepare messages for /chat endpoint
             messages = []
             messages.append({"role": "system", "content": master_agent_system_prompt})
             messages.append({"role": "system", "content": "The following document content should be used as the primary source for your answers. Only use your own knowledge to supplement or clarify if needed."})
-            
-            # Truncate document content if very long
             doc_content = document_content[:8000] if len(document_content) > 8000 else document_content
             messages.append({"role": "user", "content": f"Document Content:\n{doc_content}"})
-            
+            if discussion_context:
+                messages.append({"role": "user", "content": f"Discussion Context:\n{discussion_context}"})
             if discussion_history:
                 for i, turn in enumerate(discussion_history):
                     if turn.startswith("Agent"):
                         messages.append({"role": "assistant", "content": turn})
                     else:
                         messages.append({"role": "user", "content": turn})
-
-            # --- Extract last agent's question (if any) ---
             last_agent_question = None
             if discussion_history:
                 last_turn = discussion_history[-1]
-                # Try to extract a question from the last agent's turn
                 question_match = re.search(r'([A-Z][^\n\.!?]*\?)', last_turn)
                 if question_match:
                     last_agent_question = question_match.group(1).strip()
-
-            # --- Extract initial user prompt (for robust summary) ---
             initial_user_prompt = None
             if discussion_history:
                 for turn in discussion_history:
                     if turn.startswith("User:"):
                         initial_user_prompt = turn[len("User:"):].strip()
                         break
-
-            # Add a special user prompt for summary
             summary_prompt = ""
             if last_agent_question:
                 summary_prompt += f"The previous agent asked: '{last_agent_question}' Please answer this question first in your summary.\n"
@@ -868,30 +939,28 @@ def process_message(request):
                     "If the user asked for a specific type of conclusion (e.g., risk mitigation strategies), make sure to provide that at the end of your summary, using all the knowledge from the discussion and document in a concise yet rich manner."
                 )
             messages.append({"role": "user", "content": summary_prompt})
-
-            response_ollama = requests.post(
-                f"{OLLAMA_API_URL}/chat",
+            # Log prompt size
+            prompt_size = sum(len(m['content']) for m in messages)
+            logger.info(f"Summary LLM prompt size: {prompt_size} characters")
+            response_groq = requests.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
                 json={
                     "model": master_agent_model,
                     "messages": messages,
-                    "stream": False,
-                    "options": master_agent_options
+                    "temperature": master_agent_options["temperature"],
+                    "top_p": master_agent_options["top_p"]
                 }
             )
-            if response_ollama.status_code != 200:
-                raise Exception(f"Ollama API error: {response_ollama.text}")
-
-            result = response_ollama.json()
-            if 'message' in result:
-                answer = result['message']['content'].strip()
-            elif 'messages' in result and result['messages']:
-                answer = result['messages'][-1]['content'].strip()
-            else:
-                answer = ''
-
+            if response_groq.status_code != 200:
+                raise Exception(f"Groq API error: {response_groq.text}")
+            result = response_groq.json()
+            answer = result["choices"][0]["message"]["content"].strip() if "choices" in result and result["choices"] else ''
             final_response_content = format_response(answer)
             final_confidence = min(1.0, len(answer) / 150)
-
             logger.info("Successfully generated final summary")
             return JsonResponse({
                 'response': final_response_content,
@@ -902,7 +971,6 @@ def process_message(request):
             })
 
         # --- Regular message processing logic continues as before ---
-        # Modify the instruction based on whether it's a single agent or not
         if is_single_agent:
             full_instruction = f"Current Instruction: {message}\n\n" \
                              f"IMPORTANT: You are the ONLY agent. Provide a single, well-structured response. Do not ask questions, do not mention other agents, and do not break this into multiple responses."
@@ -913,33 +981,30 @@ def process_message(request):
         messages = []
         messages.append({"role": "system", "content": agent_system_prompt})
         messages.append({"role": "system", "content": "The following document content should be used as the primary source for your answers. Only use your own knowledge to supplement or clarify if needed."})
-        doc_content = document_content[:8000] if len(document_content) > 8000 else document_content
-        messages.append({"role": "user", "content": f"Document Content:\n{doc_content}"})
-        if discussion_history:
-            for i, turn in enumerate(discussion_history):
-                if turn.startswith("Agent"):
-                    messages.append({"role": "assistant", "content": turn})
-                else:
-                    messages.append({"role": "user", "content": turn})
+        messages.append({"role": "user", "content": f"Document Content:\n{document_content}"})
+        if discussion_context:
+            messages.append({"role": "user", "content": f"Discussion Context:\n{discussion_context}"})
         messages.append({"role": "user", "content": full_instruction})
-        response_ollama = requests.post(
-            f"{OLLAMA_API_URL}/chat",
+        # Log prompt size
+        prompt_size = sum(len(m['content']) for m in messages)
+        logger.info(f"Agent LLM prompt size: {prompt_size} characters")
+        response_groq = requests.post(
+            GROQ_API_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
             json={
-                "model": agent_model, 
+                "model": "gemma2-9b-it",
                 "messages": messages,
-                "stream": False,
-                "options": agent_options 
+                "temperature": agent_options["temperature"],
+                "top_p": agent_options["top_p"]
             }
         )
-        if response_ollama.status_code != 200:
-            raise Exception(f"Ollama API error: {response_ollama.text}")
-        result = response_ollama.json()
-        if 'message' in result:
-            answer = result['message']['content'].strip()
-        elif 'messages' in result and result['messages']:
-            answer = result['messages'][-1]['content'].strip()
-        else:
-            answer = ''
+        if response_groq.status_code != 200:
+            raise Exception(f"Groq API error: {response_groq.text}")
+        result = response_groq.json()
+        answer = result["choices"][0]["message"]["content"].strip() if "choices" in result and result["choices"] else ''
         final_response_content = format_response(answer)
         final_confidence = min(1.0, len(answer) / 150)
         if final_response_content:
@@ -1047,4 +1112,19 @@ def podcast_tts(request):
         response = TempFileResponse(open(output_wav.name, 'rb'), content_type='audio/wav', as_attachment=True, filename='podcast.wav', temp_file=output_wav.name)
         return response
     except Exception as e:
-        return JsonResponse({'error': str(e)}, status=500) 
+        return JsonResponse({'error': str(e)}, status=500)
+
+# Helper: Retry Groq API call with exponential backoff on 429
+def groq_post_with_retry(*args, max_retries=3, **kwargs):
+    delay = 1
+    for attempt in range(max_retries):
+        response = requests.post(*args, **kwargs)
+        if response.status_code != 429:
+            return response
+        time.sleep(delay)
+        delay *= 2
+    return response 
+
+# Helper: Truncate a chunk to a max length (in characters)
+def truncate_chunk(text, max_length=500):
+    return text[:max_length] if len(text) > max_length else text 
