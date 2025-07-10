@@ -28,7 +28,7 @@ This project is a multi-agent conversational AI platform that enables document-d
 
 ## Architecture
 
-- **Backend**: Django 5, SQLite, REST API, pyttsx3 for TTS, Ollama LLM (local, e.g., llama3)
+- **Backend**: Django 5, SQLite, REST API, pyttsx3 for TTS, Groq API (using gemma2)
 - **Frontend**: React (MUI), modern UI, voice and text controls
 - **LLM**: Ollama (http://localhost:11434) for all agent and podcast generation
 - **TTS**: pyttsx3 (local, multi-voice)
@@ -40,8 +40,7 @@ This project is a multi-agent conversational AI platform that enables document-d
 ### Prerequisites
 - Python 3.13+
 - Node.js 18+
-- [Ollama](https://ollama.com/) running locally with the `llama3` model pulled
-- FFmpeg (for audio conversion)
+- [Ollama](https://ollama.com/) running locally with the `nomic-embed-text` model pulled for embedding
 
 ### 1. Backend Setup
 
@@ -67,12 +66,12 @@ npm run build
 
 - The backend runs on [http://127.0.0.1:8000](http://127.0.0.1:8000) serving the static frontend files.
 
-### 3. Ollama LLM Setup
+### 3. Ollama  Setup
 
 - Download and install [Ollama](https://ollama.com/)
 - Pull the llama3 model:
   ```bash
-  ollama pull llama3
+  ollama pull nomic-embed-text
   ollama serve
   ```
 - Ensure Ollama is running at `http://localhost:11434`
@@ -105,8 +104,7 @@ npm run build
 ## Tips & Troubleshooting
 
 - **TTS not working?** Ensure `pyttsx3` and system voices are installed. On Linux, you may need `espeak` or `festival`.
-- **Ollama errors?** Make sure Ollama is running and the `llama3` model is pulled.
-- **FFmpeg errors?** Install FFmpeg and ensure it is in your system PATH.
+- **Ollama errors?** Make sure Ollama is running and the `nomic-embed-text` model is pulled.
 - **CORS issues?** The backend is configured to allow all origins for development.
 - **Database**: Uses SQLite by default. For production, switch to PostgreSQL or another robust DB.
 
