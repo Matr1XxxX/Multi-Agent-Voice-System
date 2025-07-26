@@ -33,6 +33,25 @@ import DownloadIcon from '@mui/icons-material/Download';
 import './App.css';
 import hpclLogo from './images/hpcl_logo.png';
 
+// +++ ADDED HELPER FUNCTION FOR CSRF TOKEN +++
+// This function reads the CSRF token from the cookie set by Django.
+function getCookie(name) {
+  let cookieValue = null;
+  if (document.cookie && document.cookie !== '') {
+    const cookies = document.cookie.split(';');
+    for (let i = 0; i < cookies.length; i++) {
+      const cookie = cookies[i].trim();
+      // Does this cookie string begin with the name we want?
+      if (cookie.substring(0, name.length + 1) === (name + '=')) {
+        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+        break;
+      }
+    }
+  }
+  return cookieValue;
+}
+
+
 // Mutex class for narration lock
 class Mutex {
   constructor() {
@@ -229,17 +248,19 @@ function App() {
     });
   }, [agents]);
 
-  // Modify the discussion effect to pipeline LLM and narration
+  // --- DISCUSSION TURN MANAGEMENT ---
   useEffect(() => {
+    // Conditions to run: discussion is active, not currently loading a response, agents are set, and it's a multi-agent scenario.
     if (isDiscussionActive && !isLoading && discussionAgents.length > 0 && agents.length > 1) {
-      const maxTurns = discussionLimit - 2; // 2n-1 normal responses, then 1 final summary (total discussionLimit responses)
+      
+      const maxTurns = discussionLimit - 1; 
       const isSummaryTurn = discussionTurn === maxTurns;
+
       if (isSummaryTurn) {
-        // --- Pipeline: trigger summary LLM call immediately, push to narration queue when ready ---
-        const summaryAgentId = discussionAgents[0];
-        const summaryAgent = agents.find(a => a.id === summaryAgentId);
-        if (summaryAgent) {
-          setIsDiscussionActive(false);
+        // This is the final turn, trigger the summary generation.
+        const summaryAgentId = discussionAgents[0]; // Or a designated master agent
+        if (agents.find(a => a.id === summaryAgentId)) {
+          setIsDiscussionActive(false); // End the discussion loop
           processAgentTurn(
             summaryAgentId,
             discussionHistory.join('\n'),
@@ -247,29 +268,29 @@ function App() {
             null,
             true, // isLastTurn
             true  // isFinalSummary
-          ).then((summaryResponse) => {
-            if (summaryResponse) {
-              setLastUserPrompt('Final Summary of Discussion');
-            }
-          });
+          );
         }
+        // Clear discussion state
         setDiscussionAgents([]);
         setDiscussionHistory([]);
       } else if (discussionTurn < maxTurns) {
-        // Pipeline: trigger next agent LLM call immediately after previous response
-        const nextTurn = discussionTurn + 1;
-        const nextAgentIndex = nextTurn % discussionAgents.length;
-        const nextAgentId = discussionAgents[nextAgentIndex];
-        const latestDiscussion = discussionHistory.join('\n');
-        // Only trigger if not already in progress
-        processAgentTurn(nextAgentId, latestDiscussion, false, null, false).then((responseContent) => {
-          if (responseContent) {
-            setDiscussionTurn(nextTurn);
-          }
-        });
+        // This is a regular agent-to-agent turn.
+        // NOTE: We do NOT process turn 0 here, as it's handled by `handleSend` to pass the initial prompt.
+        if (discussionTurn > 0) {
+            const currentAgentIndex = discussionTurn % discussionAgents.length;
+            const currentAgentId = discussionAgents[currentAgentIndex];
+            const latestDiscussion = discussionHistory.join('\n');
+            
+            processAgentTurn(currentAgentId, latestDiscussion, false, null, false).then((responseContent) => {
+              if (responseContent) {
+                setDiscussionTurn(prevTurn => prevTurn + 1);
+              }
+            });
+        }
       }
     }
-  }, [isDiscussionActive, isLoading, discussionTurn, discussionAgents, discussionHistory, currentDocument, isNarratingQueue, narrationQueue.length, agents.length, discussionLimit]);
+  }, [isDiscussionActive, isLoading, discussionTurn]);
+
 
   // --- Narration queue handler ---
   useEffect(() => {
@@ -309,9 +330,15 @@ function App() {
           ? messageContext 
           : `Continue the discussion. The current conversation is:\n${messageContext}`;
         const isSingleAgent = agents.length === 1;
+        
+        const csrftoken = getCookie('csrftoken'); // Get CSRF token
+        
         const response = await fetch('http://127.0.0.1:8000/api/process-message/', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+              'Content-Type': 'application/json',
+              'X-CSRFToken': csrftoken // Add CSRF token to headers
+          },
           body: JSON.stringify({
             document_id: currentDocument.id,
             message: agentInstruction,
@@ -386,9 +413,15 @@ function App() {
         ? messageContext 
         : `Continue the discussion. The current conversation is:\n${messageContext}`;
       const isSingleAgent = agents.length === 1;
+
+      const csrftoken = getCookie('csrftoken'); // Get CSRF token
+
       const response = await fetch('http://127.0.0.1:8000/api/process-message/', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+            'Content-Type': 'application/json',
+            'X-CSRFToken': csrftoken // Add CSRF token to headers
+        },
         body: JSON.stringify({
           document_id: currentDocument.id,
           message: agentInstruction,
@@ -533,9 +566,14 @@ function App() {
     const formData = new FormData();
     formData.append('file', file);
 
+    const csrftoken = getCookie('csrftoken'); // Get CSRF token
+
     try {
       const response = await fetch('http://127.0.0.1:8000/api/upload/', {
         method: 'POST',
+        headers: {
+            'X-CSRFToken': csrftoken // Add CSRF token to headers
+        },
         body: formData,
       });
 
@@ -669,6 +707,9 @@ function App() {
     const prompt = typeof promptOverride === 'string' ? promptOverride : input.trim();
     if (!prompt || !currentDocument) return;
     setInput('');
+    
+    const csrftoken = getCookie('csrftoken'); // Get CSRF token for all requests in this function
+
     // Route to podcast Q&A if podcast script is loaded and not in Q&A or loading
     if (isPodcastMode && podcastTurns.length > 0 && !miniScriptNarrationActive && !isPodcastLoading) {
       setPendingPodcastQA(true);
@@ -695,7 +736,10 @@ function App() {
       try {
         const response = await fetch('http://127.0.0.1:8000/api/process-message/', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+              'Content-Type': 'application/json',
+              'X-CSRFToken': csrftoken 
+          },
           body: JSON.stringify({
             document_id: currentDocument.id,
             message: prompt,
@@ -726,7 +770,8 @@ function App() {
           for (let line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            const match = trimmed.match(/^\**\s*Agent\s([12])\s*\**:?\s*(.*)$/i);
+            // +++ FIX 2: Corrected Regex for Podcast Parsing +++
+            const match = trimmed.match(/^\**\s*Agent\s*([12])\s*\**:?\s*(.*)$/i);
             if (match) {
               qaTurns.push({ agent: `Agent ${match[1]}`, text: match[2] });
             }
@@ -763,7 +808,10 @@ function App() {
       try {
         const response = await fetch('http://127.0.0.1:8000/api/process-message/', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+              'Content-Type': 'application/json',
+              'X-CSRFToken': csrftoken
+          },
           body: JSON.stringify({
             document_id: currentDocument.id,
             message: prompt,
@@ -803,7 +851,8 @@ function App() {
           for (let line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            const match = trimmed.match(/^\**\s*Agent\s([12])\s*\**:?\s*(.*)$/i);
+            // +++ FIX 2: Corrected Regex for Podcast Parsing +++
+            const match = trimmed.match(/^\**\s*Agent\s*([12])\s*\**:?\s*(.*)$/i);
             if (match) {
               turns.push({ agent: `Agent ${match[1]}`, text: match[2], turnNumber: turnCounter++ });
             }
@@ -868,7 +917,10 @@ function App() {
       }
       const response = await fetch('http://127.0.0.1:8000/api/process-message/', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+            'Content-Type': 'application/json',
+            'X-CSRFToken': csrftoken
+        },
         body: JSON.stringify({
           document_id: currentDocument.id,
           message: prompt,
@@ -904,7 +956,14 @@ function App() {
         // Set the initiator as the first agent for this discussion
         setDiscussionAgents(agents.map(a => a.id).sort((a, b) => (a === data.initiator_agent_id ? -1 : b === data.initiator_agent_id ? 1 : a - b)));
         setDiscussionTurn(0);
-        await processAgentTurn(data.initiator_agent_id, typeof data.revised_prompt === 'object' ? data.revised_prompt[String(data.initiator_agent_id)] : data.revised_prompt || prompt, true, thisRequestToken);
+        
+        // +++ FIX 1: RESTORED this line to fix turn-based discussion +++
+        // This call is necessary to process the first turn with the user's initial prompt.
+        const responseContent = await processAgentTurn(data.initiator_agent_id, typeof data.revised_prompt === 'object' ? data.revised_prompt[String(data.initiator_agent_id)] : data.revised_prompt || prompt, true, thisRequestToken);
+        if (responseContent) {
+            setDiscussionTurn(prev => prev + 1);
+        }
+
       } else if (Array.isArray(data.responding_agent_ids) && data.responding_agent_ids.length > 0) {
         // Multi-agent, non-discussion: trigger each agent in order, using their specific prompt if revised_prompt is a dict
         for (const agentId of data.responding_agent_ids) {
@@ -945,10 +1004,14 @@ function App() {
   // Update playVoiceResponse to set speakingAgentId and return a promise that resolves when narration is done
   const playVoiceResponse = async (text, agentId) => {
     return new Promise(async (resolve, reject) => {
+      const csrftoken = getCookie('csrftoken'); // Get CSRF token
       try {
         const response = await fetch('http://127.0.0.1:8000/api/voice-response/', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+              'Content-Type': 'application/json',
+              'X-CSRFToken': csrftoken
+          },
           body: JSON.stringify({ text, agent_id: agentId })
         });
         if (!response.ok) {
@@ -1281,9 +1344,13 @@ function App() {
           setIsNarrating(true);
           // Request TTS for this line
           try {
+            const csrftoken = getCookie('csrftoken'); // Get CSRF token
             const ttsRes = await fetch('http://127.0.0.1:8000/api/podcast-tts/', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: { 
+                  'Content-Type': 'application/json',
+                  'X-CSRFToken': csrftoken
+              },
               body: JSON.stringify({ script: `${turn.agent}: ${turn.text}` })
             });
             if (!ttsRes.ok) throw new Error('TTS failed');
@@ -1392,9 +1459,13 @@ function App() {
           setThinkingAgentId(null);
           setIsNarrating(true);
           try {
+            const csrftoken = getCookie('csrftoken'); // Get CSRF token
             const ttsRes = await fetch('http://127.0.0.1:8000/api/podcast-tts/', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: { 
+                  'Content-Type': 'application/json',
+                  'X-CSRFToken': csrftoken
+              },
               body: JSON.stringify({ script: `${turn.agent}: ${turn.text}` })
             });
             if (!ttsRes.ok) throw new Error('TTS failed');
