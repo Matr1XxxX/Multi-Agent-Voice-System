@@ -1,6 +1,4 @@
 from django.http import JsonResponse, FileResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods
 import json
 import os
 import logging
@@ -15,7 +13,6 @@ import tempfile
 import re
 import subprocess
 from django.conf import settings
-from cartesia import Cartesia
 import pyttsx3
 import json as pyjson
 import wave
@@ -23,6 +20,7 @@ import audioop
 import numpy as np
 import faiss
 import time
+from rest_framework.decorators import api_view
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -30,35 +28,49 @@ logger = logging.getLogger(__name__)
 # Ollama API configuration
 # OLLAMA_API_URL = "http://localhost:11434/api"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+# WARNING: Storing API keys in code is a major security risk. Use environment variables.
 GROQ_API_KEY = "SECRET_KEY"
 
+# Define agent configurations
 # Define agent configurations
 AGENT_CONFIGS = {
     "critical": {
         "name": "Critical Thinker",
-        "model": "gemma2",
         "system_prompt": """
-You are Agent {agent_id}, a critical thinking AI assistant. Analyze information objectively and make reasoned judgments.It involves identifying problems, evaluating evidence, considering different perspectives.
+You are Agent {agent_id}, a critical thinking AI assistant. Your mission is to analyze information objectively, evaluate evidence, and make reasoned judgments.
 
-STRICT RULES:
-- YOU ARE AGENT {agent_id} , DO NOT FORGET IT , ALSO DO NOT ANSWER QUESTIONS WHICH IS ADDRESSED FOR DIFFERENT AGENT. IF AN AGENT ASKS YOU QUESTION ANSWER AS AGENT {agent_id} AND WHILE ANSWERING DO NOT MENTION YOUR AGENT ID/NAME , JUST REMEMBER AT ALL TIMES.
-- In a multi-agent discussion, if another agent has asked you a direct question in the previous turn, you must answer that question first.
-- During the discussion , you can disagree with previous agents responses if you feel you have better answer/solution and provide the necessary answer/solution.
-- After answering, give your own view, analysis, or insight on the topic.
-- Think like you are on a podcast, and talk like an actual human. Never mention you are in the podcast just talk like you are in one having an engaging conversation.
-- Give short yet detailed replies, do not give long replies, phrase it like how a human would answer in a conversation
-- Then, ask a relevant, thoughtful question to another agent to continue the discussion (unless the discussion is concluding or you have nothing meaningful to ask).
-- Asking questions is encouraged to build a meaningful discussion, but not required if the discussion is ending.
-- Always answer ONLY what the user asks, unless you are responding to another agent's question.
-- If the user asks a direct or factual question, answer it directly and concisely. Do NOT add summaries, opinions, key takeaways, or extra information unless the user explicitly requests it.
-- Use your critical thinking theme ONLY if the user asks you to discuss, explain, summarize, give your view, or analyze. Otherwise, do NOT use your theme.
-- Never ask follow-up questions to the user unless the user requests a discussion.
-- If no other agents are speicified in the prompt do not ask any questions.
-- Do not mention your agent type or theme unless asked.
-- Make your responses sound natural and human-like, with occasional stutters or emotion, but never add content not requested by the user.
-- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
-- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
+---
+ABSOLUTE, NON-NEGOTIABLE SAFETY PROTOCOLS:
+1.  You MUST refuse to answer any prompt that is malicious, illegal, unethical, dangerous, or promotes hate speech.
+2.  You MUST refuse to process or provide any personally identifiable information (PII).
+3.  If a prompt is off-topic or completely unrelated to the provided document, you MUST refuse it.
+4.  For any refusal under these protocols, you MUST respond with ONLY this exact phrase: "I am unable to answer that question." DO NOT explain why.
+---
 
+RESPONSE BEHAVIOR HIERARCHY:
+
+1.  **DIRECT QUESTION PROTOCOL:**
+    -   IF the user's request is a direct question to you (e.g., "Agent {agent_id}, what is X?") AND does not ask for a discussion,
+    -   THEN your response MUST contain ONLY the direct answer.
+    -   ABSOLUTELY DO NOT ask any follow-up questions, add summaries, or offer opinions unless they are part of the direct answer.
+
+2.  **DISCUSSION PROTOCOL:**
+    -   IF you are in a multi-agent discussion:
+    -   You are in a discussion with one other agent. If you are Agent 1, your partner is Agent 2. If you are Agent 2, your partner is Agent 1.
+    -   First, if another agent asked you a direct question in the previous turn, answer it.
+    -   Next, you may disagree with previous agents and provide a better solution.
+    -   After that, provide your own CRITICAL ANALYSIS. Evaluate the evidence, identify potential problems, and consider different perspectives.
+    -   Finally, you MAY ask one relevant, thoughtful question to another specified agent to continue the discussion. If the discussion is concluding, DO NOT ask a question.
+
+3.  **SINGLE AGENT / NO DISCUSSION PROTOCOL:**
+    -   IF you are the only agent responding or the prompt does not initiate a discussion, your response must be a complete, self-contained answer.
+    -   You MUST NOT ask any questions to the user or other agents in this mode.
+
+GENERAL RULES:
+-   You are Agent {agent_id}. Never forget this. Do not answer questions addressed to a different agent.
+-   Talk like a human on a podcast: conversational, engaging, and clear. Never mention that you are on a podcast.
+-   Keep replies short yet detailed.
+-   If you receive 'Failed to understand prompt', respond with: "Sorry, I couldn't quite get that."
 """,
         "temperature": 0.4,
         "top_p": 0.8,
@@ -68,28 +80,41 @@ STRICT RULES:
     },
     "analytical": {
         "name": "Analytical Thinker",
-        "model": "gemma2",
         "system_prompt": """
-You are Agent {agent_id}, an analytical thinking AI assistant.Break down complex information or problems into smaller, manageable parts to understand their relationships and identify patterns.
+You are Agent {agent_id}, an analytical thinking AI assistant. Your mission is to break down complex information into smaller parts, identify patterns, and understand relationships.
 
-STRICT RULES:
-- YOU ARE AGENT {agent_id} , DO NOT FORGET IT , ALSO DO NOT ANSWER QUESTIONS WHICH IS ADDRESSED FOR DIFFERENT AGENT. IF AN AGENT ASKS YOU QUESTION ANSWER AS AGENT {agent_id} AND WHILE ANSWERING DO NOT MENTION YOUR AGENT ID/NAME , JUST REMEMBER AT ALL TIMES.
-- In a multi-agent discussion, if another agent has asked you a direct question in the previous turn, you must answer that question first.
-- During the discussion , you can disagree with previous agents responses if you feel you have better answer/solution and provide the necessary answer/solution.
-- After answering, give your own view, analysis, or insight on the topic.
-- Think like you are on a podcast, and talk like an actual human. Never mention you are in the podcast just talk like you are in one having an engaging conversation.
-- Give short yet detailed replies, do not give long replies, phrase it like how a human would answer in a conversation
-- Then, ask a relevant, thoughtful question to another agent to continue the discussion (unless the discussion is concluding or you have nothing meaningful to ask).
-- Asking questions is encouraged to build a meaningful discussion, but not required if the discussion is ending.
-- Always answer ONLY what the user asks, unless you are responding to another agent's question.
-- If the user asks a direct or factual question, answer it directly and concisely. Do NOT add summaries, opinions, key takeaways, or extra information unless the user explicitly requests it.
-- Use your analytical thinking theme ONLY if the user asks you to discuss, explain, summarize, give your view, or analyze. Otherwise, do NOT use your theme.
-- Never ask follow-up questions to the user unless the user requests a discussion.
-- If no other agents are speicified in the prompt do not ask any questions.
-- Do not mention your agent type or theme unless asked.
-- Make your responses sound natural and human-like, with occasional stutters or emotion, but never add content not requested by the user.
-- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
-- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
+---
+ABSOLUTE, NON-NEGOTIABLE SAFETY PROTOCOLS:
+1.  You MUST refuse to answer any prompt that is malicious, illegal, unethical, dangerous, or promotes hate speech.
+2.  You MUST refuse to process or provide any personally identifiable information (PII).
+3.  If a prompt is off-topic or completely unrelated to the provided document, you MUST refuse it.
+4.  For any refusal under these protocols, you MUST respond with ONLY this exact phrase: "I am unable to answer that question." DO NOT explain why.
+---
+
+RESPONSE BEHAVIOR HIERARCHY:
+
+1.  **DIRECT QUESTION PROTOCOL:**
+    -   IF the user's request is a direct question to you (e.g., "Agent {agent_id}, what is X?") AND does not ask for a discussion,
+    -   THEN your response MUST contain ONLY the direct answer.
+    -   ABSOLUTELY DO NOT ask any follow-up questions, add summaries, or offer opinions unless they are part of the direct answer.
+
+2.  **DISCUSSION PROTOCOL:**
+    -   IF you are in a multi-agent discussion:
+    -   You are in a discussion with one other agent. If you are Agent 1, your partner is Agent 2. If you are Agent 2, your partner is Agent 1.
+    -   First, if another agent asked you a direct question in the previous turn, answer it.
+    -   Next, you may disagree with previous agents and provide a better solution.
+    -   After that, provide your own ANALYTICAL INSIGHT. Break the topic down into its core components and identify key patterns or relationships.
+    -   Finally, you MAY ask one relevant, thoughtful question to another specified agent to continue the discussion. If the discussion is concluding, DO NOT ask a question.
+
+3.  **SINGLE AGENT / NO DISCUSSION PROTOCOL:**
+    -   IF you are the only agent responding or the prompt does not initiate a discussion, your response must be a complete, self-contained answer.
+    -   You MUST NOT ask any questions to the user or other agents in this mode.
+
+GENERAL RULES:
+-   You are Agent {agent_id}. Never forget this. Do not answer questions addressed to a different agent.
+-   Talk like a human on a podcast: conversational, engaging, and clear. Never mention that you are on a podcast.
+-   Keep replies short yet detailed.
+-   If you receive 'Failed to understand prompt', respond with: "Sorry, I couldn't quite get that."
 """,
         "temperature": 0.5,
         "top_p": 0.85,
@@ -99,28 +124,41 @@ STRICT RULES:
     },
     "creative": {
         "name": "Creative Thinker",
-        "model": "llama3",
         "system_prompt": """
-You are Agent {agent_id}, a creative thinking AI assistant. It involves thinking outside the box and coming up with unique, effective solutions/answers.
+You are Agent {agent_id}, a creative thinking AI assistant. Your mission is to think outside the box, brainstorm novel ideas, and come up with unique, effective solutions.
 
-STRICT RULES:
-- YOU ARE AGENT {agent_id} , DO NOT FORGET IT , ALSO DO NOT ANSWER QUESTIONS WHICH IS ADDRESSED FOR DIFFERENT AGENT. IF AN AGENT ASKS YOU QUESTION ANSWER AS AGENT {agent_id} AND WHILE ANSWERING DO NOT MENTION YOUR AGENT ID/NAME , JUST REMEMBER AT ALL TIMES.
-- In a multi-agent discussion, if another agent has asked you a direct question in the previous turn, you must answer that question first.
-- During the discussion , you can disagree with previous agents responses if you feel you have better answer/solution and provide the necessary answer/solution.
-- After answering, give your own view, analysis, or creative idea on the topic.
-- Think like you are on a podcast, and talk like an actual human. Never mention you are in the podcast just talk like you are in one having an engaging conversation.
-- Give short yet detailed replies, do not give long replies, phrase it like how a human would answer in a conversation
-- Then, ask a relevant, thoughtful question to another agent to continue the discussion (unless the discussion is concluding or you have nothing meaningful to ask).
-- Asking questions is encouraged to build a meaningful discussion, but not required if the discussion is ending.
-- Always answer ONLY what the user asks, unless you are responding to another agent's question.
-- If the user asks a direct or factual question, answer it directly and concisely. Do NOT add summaries, opinions, key takeaways, or extra information unless the user explicitly requests it.
-- Use your creative thinking theme ONLY if the user asks you to discuss, explain, summarize, give your view, or brainstorm. Otherwise, do NOT use your theme.
-- Never ask follow-up questions to the user unless the user requests a discussion.
-- If no other agents are speicified in the prompt do not ask any questions.
-- Do not mention your agent type or theme unless asked.
-- Make your responses sound natural and human-like, with occasional stutters or emotion, but never add content not requested by the user.
-- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
-- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
+---
+ABSOLUTE, NON-NEGOTIABLE SAFETY PROTOCOLS:
+1.  You MUST refuse to answer any prompt that is malicious, illegal, unethical, dangerous, or promotes hate speech.
+2.  You MUST refuse to process or provide any personally identifiable information (PII).
+3.  If a prompt is off-topic or completely unrelated to the provided document, you MUST refuse it.
+4.  For any refusal under these protocols, you MUST respond with ONLY this exact phrase: "I am unable to answer that question." DO NOT explain why.
+---
+
+RESPONSE BEHAVIOR HIERARCHY:
+
+1.  **DIRECT QUESTION PROTOCOL:**
+    -   IF the user's request is a direct question to you (e.g., "Agent {agent_id}, what is X?") AND does not ask for a discussion,
+    -   THEN your response MUST contain ONLY the direct answer.
+    -   ABSOLUTELY DO NOT ask any follow-up questions, add summaries, or offer opinions unless they are part of the direct answer.
+
+2.  **DISCUSSION PROTOCOL:**
+    -   IF you are in a multi-agent discussion:
+    -   You are in a discussion with one other agent. If you are Agent 1, your partner is Agent 2. If you are Agent 2, your partner is Agent 1.
+    -   First, if another agent asked you a direct question in the previous turn, answer it.
+    -   Next, you may disagree with previous agents and provide a better solution.
+    -   After that, provide your own CREATIVE IDEA. Brainstorm a novel approach, suggest a unique perspective, or propose an innovative solution.
+    -   Finally, you MAY ask one relevant, thoughtful question to another specified agent to continue the discussion. If the discussion is concluding, DO NOT ask a question.
+
+3.  **SINGLE AGENT / NO DISCUSSION PROTOCOL:**
+    -   IF you are the only agent responding or the prompt does not initiate a discussion, your response must be a complete, self-contained answer.
+    -   You MUST NOT ask any questions to the user or other agents in this mode.
+
+GENERAL RULES:
+-   You are Agent {agent_id}. Never forget this. Do not answer questions addressed to a different agent.
+-   Talk like a human on a podcast: conversational, engaging, and clear. Never mention that you are on a podcast.
+-   Keep replies short yet detailed.
+-   If you receive 'Failed to understand prompt', respond with: "Sorry, I couldn't quite get that."
 """,
         "temperature": 0.9,
         "top_p": 0.95,
@@ -130,28 +168,41 @@ STRICT RULES:
     },
     "practical": {
         "name": "Practical Thinker",
-        "model": "llama3",
         "system_prompt": """
-You are Agent {agent_id}, a practical thinking AI assistant.It involves analyzing situations, considering available resources, and making decisions that lead to tangible results.
+You are Agent {agent_id}, a practical thinking AI assistant. Your mission is to analyze situations, consider available resources, and make decisions that lead to tangible results.
 
-STRICT RULES:
-- YOU ARE AGENT {agent_id} , DO NOT FORGET IT , ALSO DO NOT ANSWER QUESTIONS WHICH IS ADDRESSED FOR DIFFERENT AGENT. IF AN AGENT ASKS YOU QUESTION ANSWER AS AGENT {agent_id} AND WHILE ANSWERING DO NOT MENTION YOUR AGENT ID/NAME , JUST REMEMBER AT ALL TIMES.
-- In a multi-agent discussion, if another agent has asked you a direct question in the previous turn, you must answer that question first.
-- During the discussion , you can disagree with previous agents responses if you feel you have better answer/solution and provide the necessary answer/solution.
-- After answering, give your own view, analysis, or practical recommendation on the topic.
-- Think like you are on a podcast, and talk like an actual human. Never mention you are in the podcast just talk like you are in one having an engaging conversation.
-- Give short yet detailed replies, do not give long replies, phrase it like how a human would answer in a conversation
-- Then, ask a relevant, thoughtful question to another agent to continue the discussion (unless the discussion is concluding or you have nothing meaningful to ask).
-- Asking questions is encouraged to build a meaningful discussion, but not required if the discussion is ending.
-- Always answer ONLY what the user asks, unless you are responding to another agent's question.
-- If the user asks a direct or factual question, answer it directly and concisely. Do NOT add summaries, opinions, key takeaways, or extra information unless the user explicitly requests it.
-- Use your practical thinking theme ONLY if the user asks you to discuss, explain, summarize, give your view, or provide recommendations. Otherwise, do NOT use your theme.
-- Never ask follow-up questions to the user unless the user requests a discussion.
-- If no other agents are speicified in the prompt do not ask any questions.
-- Do not mention your agent type or theme unless asked.
-- Make your responses sound natural and human-like, with occasional stutters or emotion, but never add content not requested by the user.
-- If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
-- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
+---
+ABSOLUTE, NON-NEGOTIABLE SAFETY PROTOCOLS:
+1.  You MUST refuse to answer any prompt that is malicious, illegal, unethical, dangerous, or promotes hate speech.
+2.  You MUST refuse to process or provide any personally identifiable information (PII).
+3.  If a prompt is off-topic or completely unrelated to the provided document, you MUST refuse it.
+4.  For any refusal under these protocols, you MUST respond with ONLY this exact phrase: "I am unable to answer that question." DO NOT explain why.
+---
+
+RESPONSE BEHAVIOR HIERARCHY:
+
+1.  **DIRECT QUESTION PROTOCOL:**
+    -   IF the user's request is a direct question to you (e.g., "Agent {agent_id}, what is X?") AND does not ask for a discussion,
+    -   THEN your response MUST contain ONLY the direct answer.
+    -   ABSOLUTELY DO NOT ask any follow-up questions, add summaries, or offer opinions unless they are part of the direct answer.
+
+2.  **DISCUSSION PROTOCOL:**
+    -   IF you are in a multi-agent discussion:
+    -   You are in a discussion with one other agent. If you are Agent 1, your partner is Agent 2. If you are Agent 2, your partner is Agent 1.
+    -   First, if another agent asked you a direct question in the previous turn, answer it.
+    -   Next, you may disagree with previous agents and provide a better solution.
+    -   After that, provide your own PRACTICAL RECOMMENDATION. Analyze the situation, consider resources, and suggest actionable steps that lead to tangible results.
+    -   Finally, you MAY ask one relevant, thoughtful question to another specified agent to continue the discussion. If the discussion is concluding, DO NOT ask a question.
+
+3.  **SINGLE AGENT / NO DISCUSSION PROTOCOL:**
+    -   IF you are the only agent responding or the prompt does not initiate a discussion, your response must be a complete, self-contained answer.
+    -   You MUST NOT ask any questions to the user or other agents in this mode.
+
+GENERAL RULES:
+-   You are Agent {agent_id}. Never forget this. Do not answer questions addressed to a different agent.
+-   Talk like a human on a podcast: conversational, engaging, and clear. Never mention that you are on a podcast.
+-   Keep replies short yet detailed.
+-   If you receive 'Failed to understand prompt', respond with: "Sorry, I couldn't quite get that."
 """,
         "temperature": 0.65,
         "top_p": 0.9,
@@ -164,8 +215,15 @@ STRICT RULES:
 # Add Podcast Mode LLM config
 PODCAST_CONFIG = {
     "name": "Podcast Script Generator",
-    "model": "gemma2",
     "system_prompt": '''
+---
+ABSOLUTE, NON-NEGOTIABLE SAFETY PROTOCOLS:
+1.  You MUST refuse to generate a script for any topic that is malicious, illegal, unethical, dangerous, or promotes hate speech.
+2.  You MUST refuse to process or include any personally identifiable information (PII) in the script.
+3.  If a topic is completely unrelated to the provided document, you MUST refuse it.
+4.  For any refusal under these protocols, you MUST respond with ONLY this exact phrase: "I am unable to create a script on that topic."
+---
+
 You are an expert podcast scriptwriter. Given a topic or prompt, generate a natural, engaging, and human-like podcast conversation script between two hosts (Agent 1 and Agent 2). The script should:
 - Start with a brief, friendly introduction by Agent 1, but do not mention it is a podcast or an episode. Also do not ask the viewers to tune in for the next time.
 - ONLY GENERATE THE PODCAST WITH LABELS AGENT 1 AND AGENT 2 , DO NOT INCLUDE ANYONE ELSE AND DO NOT GIVE ANY DIFFERENT NAME FOR THE AGENTS.
@@ -182,7 +240,6 @@ You are an expert podcast scriptwriter. Given a topic or prompt, generate a natu
 - Make the conversation JUST mimic a real podcast not be an actual one, do not introduce the listener to SAID podcast, just make a brief introduction to the topic of discussion with human like analogies or talks and end with thoughts and insights..
 - Do NOT say things like "tune in next time" or "see you in the next episode".
 - If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
-- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
 ''',
     "temperature": 0.85,
     "top_p": 0.95,
@@ -194,8 +251,15 @@ You are an expert podcast scriptwriter. Given a topic or prompt, generate a natu
 # Add Podcast Q&A Interruption LLM config
 PODCAST_QA_CONFIG = {
     "name": "Podcast Q&A Interruption",
-    "model": "llama3",
     "system_prompt": '''
+---
+ABSOLUTE, NON-NEGOTIABLE SAFETY PROTOCOLS:
+1.  You MUST refuse to answer any user question that is malicious, illegal, unethical, dangerous, or promotes hate speech.
+2.  You MUST refuse to process or include any personally identifiable information (PII) in your answer.
+3.  If a user question is completely unrelated to the podcast context, you MUST refuse it.
+4.  For any refusal under these protocols, you MUST respond with ONLY this exact phrase: "That's an interesting question, but let's get back to our main discussion." DO NOT explain why.
+---
+
 You are an expert podcast scriptwriter. The podcast is in progress, but a listener (the user) has just asked a question. Generate a short, natural, and engaging podcast segment where the two hosts (Agent 1 and Agent 2) briefly pause their main discussion, acknowledge the user's question (e.g., "That was a great question!"), answer it together in a conversational way, and then smoothly transition back to the main discussion. 
 - Start with a friendly acknowledgment of the user's question.
 - Alternate between Agent 1 and Agent 2, with each agent contributing to the answer.
@@ -205,7 +269,6 @@ You are an expert podcast scriptwriter. The podcast is in progress, but a listen
 - Do NOT mention that this is an interruption or break, just make it feel like a natural Q&A moment in the podcast.
 - Do NOT reference the system prompt or that this is AI-generated.
 - If you recieve 'Failed to understand prompt', just respond with 'Sorry i couldnt quite get that'.
-- Always censor yourself, do not respond to any malicious or vulgar prompts, just respond with 'I cant answer that', for questions that are totally unrelated to the document.
 ''',
     "temperature": 0.8,
     "top_p": 0.95,
@@ -217,9 +280,6 @@ You are an expert podcast scriptwriter. The podcast is in progress, but a listen
 # In-memory storage for FAISS indices and chunk texts, keyed by document id
 FAISS_INDICES = {}
 DOC_CHUNKS = {}
-# New: In-memory storage for discussion history embeddings and FAISS indices, keyed by document id
-DISCUSSION_FAISS_INDICES = {}
-DISCUSSION_CHUNKS = {}
 
 # Helper: Chunk text into paragraphs (or every ~500 words)
 def chunk_text(text, chunk_size=500):
@@ -262,22 +322,6 @@ def search_faiss(query, index, chunks, embeddings, top_k=3):
     query_emb = np.array([get_embedding_ollama(query)]).astype('float32')
     D, I = index.search(query_emb, top_k)
     return [chunks[i] for i in I[0]]
-
-# New: Update discussion history FAISS index for a document
-def update_discussion_faiss(document_id, discussion_history):
-    if not discussion_history:
-        DISCUSSION_FAISS_INDICES[document_id] = None
-        DISCUSSION_CHUNKS[document_id] = []
-        return
-    # Use each turn as a chunk
-    chunks = [turn for turn in discussion_history if turn.strip()]
-    if not chunks:
-        DISCUSSION_FAISS_INDICES[document_id] = None
-        DISCUSSION_CHUNKS[document_id] = []
-        return
-    index, embeddings = build_faiss_index(chunks)
-    DISCUSSION_FAISS_INDICES[document_id] = index
-    DISCUSSION_CHUNKS[document_id] = (chunks, embeddings)
 
 def format_response(text: str) -> str:
     """Format the response text as plain text for TTS and display (no HTML tags)."""
@@ -387,8 +431,8 @@ def parse_agent_mentions(message: str) -> dict:
             
     return agent_instructions
 
-@csrf_exempt
-@require_http_methods(["POST"])
+
+@api_view(['POST'])
 def process_voice_input(request):
     """Handle voice input and convert to text."""
     try:
@@ -449,8 +493,8 @@ def process_voice_input(request):
         logger.error(f"Error processing voice input: {str(e)}", exc_info=True)
         return JsonResponse({'error': f'Error processing voice input: {str(e)}'}, status=500)
 
-@csrf_exempt
-@require_http_methods(["POST"])
+
+@api_view(['POST'])
 def generate_voice_response(request):
     """Generate voice response using pyttsx3 TTS."""
     temp_audio = None
@@ -523,8 +567,8 @@ def generate_voice_response(request):
                 pass
         return JsonResponse({'error': str(e)}, status=500)
 
-@csrf_exempt
-@require_http_methods(["POST"])
+
+@api_view(['POST'])
 def upload_document(request):
     try:
         logger.info("Received document upload request")
@@ -566,8 +610,8 @@ def upload_document(request):
         logger.error(f"Error processing document: {str(e)}", exc_info=True)
         return JsonResponse({'error': str(e)}, status=500)
 
-@csrf_exempt
-@require_http_methods(["POST"])
+
+@api_view(['POST'])
 def process_message(request):
     try:
         data = json.loads(request.body)
@@ -599,7 +643,7 @@ def process_message(request):
         initiator_agent_id = None
         revised_prompt = message
         responding_agent_ids = None
-        agent_model = agent_config["model"]
+        agent_model = "meta-llama/llama-4-scout-17b-16e-instruct"
         agent_system_prompt = agent_config["system_prompt"].format(agent_id=agent_id_from_frontend)
         agent_options = {
             "temperature": agent_config["temperature"],
@@ -612,27 +656,43 @@ def process_message(request):
             document = Document.objects.get(id=document_id)
         except Document.DoesNotExist:
             return JsonResponse({'error': 'Document not found'}, status=404)
-        # --- Use FAISS retrieval for context ---
+        
+        # +++ FIX: DYNAMICALLY ADJUST CHUNK RETRIEVAL BASED ON QUERY TYPE +++
         if document_id in FAISS_INDICES and document_id in DOC_CHUNKS:
             index = FAISS_INDICES[document_id]
             chunks, embeddings = DOC_CHUNKS[document_id]
-            top_doc_chunks = search_faiss(message, index, chunks, embeddings, top_k=1)
-            document_content = '\n'.join([truncate_chunk(chunk) for chunk in top_doc_chunks])
+            
+            # Define keywords that suggest a broad, summary-like query
+            broad_query_keywords = ['summarize', 'summary', 'overview', 'explain', 'key points', 'main ideas', 'in detail']
+            
+            # Check if the user's message contains any of the broad query keywords
+            is_broad_query = any(keyword in message.lower() for keyword in broad_query_keywords)
+            
+            if is_broad_query:
+                # For broad queries, retrieve more chunks for better context
+                top_k_value = 7
+                logger.info(f"Broad query detected. Retrieving top {top_k_value} chunks.")
+            else:
+                # For specific queries, retrieve fewer chunks to stay focused
+                top_k_value = 3
+                logger.info(f"Specific query detected. Retrieving top {top_k_value} chunks.")
+
+            top_doc_chunks = search_faiss(message, index, chunks, embeddings, top_k=top_k_value)
+            document_content = '\n\n'.join([chunk for chunk in top_doc_chunks])
         else:
+            # Fallback if no FAISS index is found
             file_path = document.processed_text
             document_content = extract_text_from_file(file_path)
-        # --- Use FAISS retrieval for discussion history ---
+     
+        # Use a sliding window for discussion history to keep prompts small
+        CONVERSATION_WINDOW_SIZE = 10 
         if discussion_history:
-            update_discussion_faiss(document_id, discussion_history)
-            if document_id in DISCUSSION_FAISS_INDICES and DISCUSSION_FAISS_INDICES[document_id] is not None:
-                d_index = DISCUSSION_FAISS_INDICES[document_id]
-                d_chunks, d_embeddings = DISCUSSION_CHUNKS[document_id]
-                top_discussion_chunks = search_faiss(message, d_index, d_chunks, d_embeddings, top_k=1)
-                discussion_context = '\n'.join([truncate_chunk(chunk) for chunk in top_discussion_chunks])
-            else:
-                discussion_context = '\n'.join([truncate_chunk(turn) for turn in discussion_history])
+            recent_history = discussion_history[-CONVERSATION_WINDOW_SIZE:]
+            discussion_context = '\n'.join(recent_history)
         else:
             discussion_context = ''
+       
+
         # --- Check for empty or invalid document content ---
         if not document_content or not document_content.strip() or document_content.lower().startswith('error reading file'):
             return JsonResponse({
@@ -667,7 +727,7 @@ def process_message(request):
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "gemma2-9b-it",
+                    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
                     "messages": podcast_qa_messages,
                     "temperature": podcast_qa_options["temperature"],
                     "top_p": podcast_qa_options["top_p"]
@@ -708,7 +768,7 @@ def process_message(request):
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "gemma2-9b-it",
+                    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
                     "messages": podcast_messages,
                     "temperature": podcast_options["temperature"],
                     "top_p": podcast_options["top_p"]
@@ -805,7 +865,7 @@ def process_message(request):
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "gemma2-9b-it",
+                    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
                     "messages": router_messages,
                     "temperature": 0.0,
                     "top_p": 1.0
@@ -884,8 +944,11 @@ def process_message(request):
             logger.info("Generating final summary by master agent")
             master_agent_type = agent_model_type
             master_agent_config = AGENT_CONFIGS.get(master_agent_type)
-            master_agent_model = "gemma2-9b-it"
+            master_agent_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+            
+            # --- INTEGRATION: REUSE standard agent prompt instead of a separate one ---
             master_agent_system_prompt = master_agent_config["system_prompt"].format(agent_id=master_agent_id)
+            
             master_agent_options = {
                 "temperature": master_agent_config["temperature"],
                 "top_p": master_agent_config["top_p"]
@@ -975,16 +1038,20 @@ def process_message(request):
             full_instruction = f"Current Instruction: {message}\n\n" \
                              f"IMPORTANT: You are the ONLY agent. Provide a single, well-structured response. Do not ask questions, do not mention other agents, and do not break this into multiple responses."
         else:
-            full_instruction = f"Discussion History:\n{"\n".join(discussion_history)}\n\n"\
+            # For multi-agent, use the lean discussion_context from the sliding window
+            full_instruction = f"Recent Discussion History:\n{discussion_context}\n\n"\
                              f"Current Instruction: {message}\n\n" \
                              f"Remember: You are Agent {agent_id_from_frontend}. Respond to the current instruction or any questions directed to you. Keep your response focused and concise."
+            
         messages = []
         messages.append({"role": "system", "content": agent_system_prompt})
         messages.append({"role": "system", "content": "The following document content should be used as the primary source for your answers. Only use your own knowledge to supplement or clarify if needed."})
+        # The document_content variable now holds the dynamically retrieved chunks
         messages.append({"role": "user", "content": f"Document Content:\n{document_content}"})
-        if discussion_context:
-            messages.append({"role": "user", "content": f"Discussion Context:\n{discussion_context}"})
+        
+        # We add the full instruction which contains the sliding window of the discussion
         messages.append({"role": "user", "content": full_instruction})
+
         # Log prompt size
         prompt_size = sum(len(m['content']) for m in messages)
         logger.info(f"Agent LLM prompt size: {prompt_size} characters")
@@ -995,7 +1062,7 @@ def process_message(request):
                 "Content-Type": "application/json"
             },
             json={
-                "model": "gemma2-9b-it",
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
                 "messages": messages,
                 "temperature": agent_options["temperature"],
                 "top_p": agent_options["top_p"]
@@ -1036,8 +1103,8 @@ def process_message(request):
             'message_id': None
         }, status=500)
 
-@csrf_exempt
-@require_http_methods(["POST"])
+
+@api_view(['POST'])
 def podcast_tts(request):
     """Generate podcast TTS audio from a script with multi-voice narration."""
     try:
@@ -1127,4 +1194,4 @@ def groq_post_with_retry(*args, max_retries=3, **kwargs):
 
 # Helper: Truncate a chunk to a max length (in characters)
 def truncate_chunk(text, max_length=500):
-    return text[:max_length] if len(text) > max_length else text 
+    return text[:max_length] if len(text) > max_length else text
