@@ -17,7 +17,8 @@ import {
   FormControl,
   InputLabel,
   Select,
-  MenuItem
+  MenuItem,
+  LinearProgress 
 } from '@mui/material';
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
@@ -138,6 +139,8 @@ function App() {
   const [miniScriptNarrationActive, setMiniScriptNarrationActive] = useState(false);
   // Add new state for pendingPodcastQA
   const [pendingPodcastQA, setPendingPodcastQA] = useState(false);
+  // +++ New state for document upload loading +++
+  const [isUploading, setIsUploading] = useState(false);
 
   const fileInputRef = useRef(null);
   const audioRef = useRef(null);
@@ -379,7 +382,7 @@ function App() {
           for (let line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            const match = trimmed.match(/^\**\s*Agent\s([12])\s*\**:?\s*(.*)$/i);
+            const match = trimmed.match(/^\**\s*Agent\s*([12])\s*\**:?\s*(.*)$/i);
             if (match) {
               turns.push({ agent: `Agent ${match[1]}`, text: match[2], turnNumber: turnCounter++ });
             }
@@ -560,7 +563,7 @@ function App() {
     const file = event.target.files[0];
     if (!file) return;
 
-    setIsLoading(true);
+    setIsUploading(true); // +++ Start loading indicator
     setError(null);
 
     const formData = new FormData();
@@ -593,7 +596,7 @@ function App() {
     } catch (err) {
       setError(err.message);
     } finally {
-      setIsLoading(false);
+      setIsUploading(false); // +++ Stop loading indicator
     }
   };
 
@@ -770,7 +773,7 @@ function App() {
           for (let line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            // +++ FIX 2: Corrected Regex for Podcast Parsing +++
+            // +++ FIX: Corrected Regex for Podcast Parsing +++
             const match = trimmed.match(/^\**\s*Agent\s*([12])\s*\**:?\s*(.*)$/i);
             if (match) {
               qaTurns.push({ agent: `Agent ${match[1]}`, text: match[2] });
@@ -851,7 +854,7 @@ function App() {
           for (let line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            // +++ FIX 2: Corrected Regex for Podcast Parsing +++
+            // +++ FIX: Corrected Regex for Podcast Parsing +++
             const match = trimmed.match(/^\**\s*Agent\s*([12])\s*\**:?\s*(.*)$/i);
             if (match) {
               turns.push({ agent: `Agent ${match[1]}`, text: match[2], turnNumber: turnCounter++ });
@@ -957,8 +960,6 @@ function App() {
         setDiscussionAgents(agents.map(a => a.id).sort((a, b) => (a === data.initiator_agent_id ? -1 : b === data.initiator_agent_id ? 1 : a - b)));
         setDiscussionTurn(0);
         
-        // +++ FIX 1: RESTORED this line to fix turn-based discussion +++
-        // This call is necessary to process the first turn with the user's initial prompt.
         const responseContent = await processAgentTurn(data.initiator_agent_id, typeof data.revised_prompt === 'object' ? data.revised_prompt[String(data.initiator_agent_id)] : data.revised_prompt || prompt, true, thisRequestToken);
         if (responseContent) {
             setDiscussionTurn(prev => prev + 1);
@@ -1540,7 +1541,7 @@ function App() {
   }, [agents.length, isPodcastMode]);
 
   // Add a derived variable to determine if UI should be disabled
-  const disableUI = isNarrating || isLoading || isRouterProcessing || isPodcastLoading || podcastNarrationActive || isPodcastQALoading || isPlayingAudio;
+  const disableUI = isUploading || isNarrating || isLoading || isRouterProcessing || isPodcastLoading || podcastNarrationActive || isPodcastQALoading || isPlayingAudio;
 
   return (
     <>
@@ -1587,6 +1588,7 @@ function App() {
             >
               Upload Document
             </Button>
+
             {(conversationTranscript.length > 0 && !isPodcastMode) && (
               <Button
                 variant="contained"
@@ -1651,9 +1653,19 @@ function App() {
             >
               Add New Agent
             </Button>
-            <Typography variant="body2" color="text.secondary">
-              {currentDocument ? `Current document: ${currentDocument.filename}` : 'Supported formats: PDF, DOC, DOCX, TXT'}
-            </Typography>
+            
+            {/* +++ FIX: MOVED and MODIFIED Loading Indicator +++ */}
+            {isUploading && (
+                <Box sx={{ width: '20%', display: 'flex', alignItems: 'center', ml: 2 }}>
+                    <LinearProgress sx={{ width: '100%', mr: 1 }} />
+                    <Typography variant="body2" color="text.secondary">Processing...</Typography>
+                </Box>
+            )}
+            {!isUploading && (
+                <Typography variant="body2" color="text.secondary" sx={{ ml: 2 }}>
+                {currentDocument ? `Current document: ${currentDocument.filename}` : 'Supported formats: PDF, DOC, DOCX, TXT'}
+                </Typography>
+            )}
             <Box sx={{ flexGrow: 1 }} />
           </Box>
           {lastUserPrompt && (
@@ -1742,7 +1754,7 @@ function App() {
                     variant="contained"
                     color={listening ? 'error' : isMicActive ? 'info' : 'primary'}
                     onClick={listening ? stopListening : startListening}
-                    disabled={!currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
+                    disabled={isUploading || !currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
                     sx={{
                       width: 60,
                       height: 60,
@@ -1822,7 +1834,7 @@ function App() {
                 variant="contained"
                 color={listening ? 'error' : isMicActive ? 'info' : 'primary'}
                 onClick={listening ? stopListening : startListening}
-                disabled={!currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
+                disabled={isUploading || !currentDocument || !browserSupportsSpeechRecognition || isPodcastLoading}
                 sx={{
                   width: 60,
                   height: 60,
@@ -1864,7 +1876,7 @@ function App() {
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyPress}
-              disabled={!currentDocument || isPodcastLoading}
+              disabled={disableUI || !currentDocument}
               multiline
               minRows={1}
               maxRows={4}
@@ -1874,7 +1886,7 @@ function App() {
               color="primary"
               endIcon={<SendIcon />}
               onClick={() => handleSend()}
-              disabled={!input.trim() || !currentDocument || isPodcastLoading}
+              disabled={disableUI || !input.trim() || !currentDocument}
               sx={{ height: 56 }}
             >
               Send
